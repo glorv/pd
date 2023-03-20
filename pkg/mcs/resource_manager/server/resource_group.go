@@ -27,6 +27,12 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	minPriority     uint32 = 1
+	maxPriority     uint32 = 16
+	defaultPriority uint32 = 8
+)
+
 // ResourceGroup is the definition of a resource group, for REST API.
 type ResourceGroup struct {
 	sync.RWMutex
@@ -36,6 +42,8 @@ type ResourceGroup struct {
 	RUSettings *RequestUnitSettings `json:"r_u_settings,omitempty"`
 	// raw resource settings
 	RawResourceSettings *RawResourceSettings `json:"raw_resource_settings,omitempty"`
+	// group priority, value ranage is: [1, 16]
+	Priority uint32 `json:"priority"`
 }
 
 // RequestUnitSettings is the definition of the RU settings.
@@ -98,6 +106,13 @@ func (rg *ResourceGroup) CheckAndInit() error {
 	if len(rg.Name) == 0 || len(rg.Name) > 32 {
 		return errors.New("invalid resource group name, the length should be in [1,32]")
 	}
+	if rg.Priority > maxPriority {
+		return errors.Errorf("invalid group priority '%d', value should be in [1, 16]", rg.Priority)
+	}
+	// adjust value for legacy config.
+	if rg.Priority == 0 {
+		rg.Priority = defaultPriority
+	}
 	switch rg.Mode {
 	case rmpb.GroupMode_RUMode:
 		if rg.RUSettings == nil {
@@ -128,6 +143,10 @@ func (rg *ResourceGroup) PatchSettings(metaGroup *rmpb.ResourceGroup) error {
 	if metaGroup.GetMode() != rg.Mode {
 		return errors.New("only support reconfigure in same mode, maybe you should delete and create a new one")
 	}
+	if metaGroup.Priority < minPriority || rg.Priority > maxPriority {
+		return errors.Errorf("invalid group priority '%d', value should be in [1, 16]", metaGroup.Priority)
+	}
+	rg.Priority = metaGroup.Priority
 	switch rg.Mode {
 	case rmpb.GroupMode_RUMode:
 		if metaGroup.GetRUSettings() == nil {
@@ -149,8 +168,9 @@ func (rg *ResourceGroup) PatchSettings(metaGroup *rmpb.ResourceGroup) error {
 // FromProtoResourceGroup converts a rmpb.ResourceGroup to a ResourceGroup.
 func FromProtoResourceGroup(group *rmpb.ResourceGroup) *ResourceGroup {
 	rg := &ResourceGroup{
-		Name: group.Name,
-		Mode: group.Mode,
+		Name:     group.Name,
+		Mode:     group.Mode,
+		Priority: group.Priority,
 	}
 	switch group.GetMode() {
 	case rmpb.GroupMode_RUMode:
@@ -196,6 +216,7 @@ func (rg *ResourceGroup) IntoProtoResourceGroup() *rmpb.ResourceGroup {
 			RUSettings: &rmpb.GroupRequestUnitSettings{
 				RU: rg.RUSettings.RU.GetTokenBucket(),
 			},
+			Priority: rg.Priority,
 		}
 		return group
 	case rmpb.GroupMode_RawMode: // Raw mode
@@ -207,6 +228,7 @@ func (rg *ResourceGroup) IntoProtoResourceGroup() *rmpb.ResourceGroup {
 				IoRead:  rg.RawResourceSettings.IOReadBandwidth.GetTokenBucket(),
 				IoWrite: rg.RawResourceSettings.IOWriteBandwidth.GetTokenBucket(),
 			},
+			Priority: rg.Priority,
 		}
 		return group
 	}
