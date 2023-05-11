@@ -33,8 +33,9 @@ type ResourceGroup struct {
 	Name string         `json:"name"`
 	Mode rmpb.GroupMode `json:"mode"`
 	// RU settings
-	RUSettings *RequestUnitSettings `json:"r_u_settings,omitempty"`
-	Priority   uint32               `json:"priority"`
+	RUSettings   *RequestUnitSettings `json:"r_u_settings,omitempty"`
+	Priority     uint32               `json:"priority"`
+	IsBackground bool                 `json:"is_background"`
 }
 
 // RequestUnitSettings is the definition of the RU settings.
@@ -89,6 +90,7 @@ func (rg *ResourceGroup) PatchSettings(metaGroup *rmpb.ResourceGroup) error {
 		return errors.New("invalid resource group priority, the value should be in [0,16]")
 	}
 	rg.Priority = metaGroup.Priority
+	rg.IsBackground = metaGroup.IsBackground
 	switch rg.Mode {
 	case rmpb.GroupMode_RUMode:
 		settings := metaGroup.GetRUSettings()
@@ -107,9 +109,10 @@ func (rg *ResourceGroup) PatchSettings(metaGroup *rmpb.ResourceGroup) error {
 // FromProtoResourceGroup converts a rmpb.ResourceGroup to a ResourceGroup.
 func FromProtoResourceGroup(group *rmpb.ResourceGroup) *ResourceGroup {
 	rg := &ResourceGroup{
-		Name:     group.Name,
-		Mode:     group.Mode,
-		Priority: group.Priority,
+		Name:         group.Name,
+		Mode:         group.Mode,
+		Priority:     group.Priority,
+		IsBackground: group.IsBackground,
 	}
 	switch group.GetMode() {
 	case rmpb.GroupMode_RUMode:
@@ -148,9 +151,10 @@ func (rg *ResourceGroup) IntoProtoResourceGroup() *rmpb.ResourceGroup {
 	switch rg.Mode {
 	case rmpb.GroupMode_RUMode: // RU mode
 		group := &rmpb.ResourceGroup{
-			Name:     rg.Name,
-			Mode:     rmpb.GroupMode_RUMode,
-			Priority: rg.Priority,
+			Name:         rg.Name,
+			Mode:         rmpb.GroupMode_RUMode,
+			Priority:     rg.Priority,
+			IsBackground: rg.IsBackground,
 			RUSettings: &rmpb.GroupRequestUnitSettings{
 				RU: rg.RUSettings.RU.GetTokenBucket(),
 			},
