@@ -29,7 +29,7 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/tikv/pd/pkg/core/storelimit"
 	"github.com/tikv/pd/pkg/errs"
-	rm "github.com/tikv/pd/pkg/mcs/resource_manager/server"
+	rm "github.com/tikv/pd/pkg/mcs/resourcemanager/server"
 	"github.com/tikv/pd/pkg/utils/configutil"
 	"github.com/tikv/pd/pkg/utils/grpcutil"
 	"github.com/tikv/pd/pkg/utils/metricutil"
@@ -213,6 +213,7 @@ const (
 	defaultEnableGRPCGateway    = true
 	defaultDisableErrorVerbose  = true
 	defaultEnableWitness        = false
+	defaultHaltScheduling       = false
 
 	defaultDashboardAddress = "auto"
 
@@ -238,6 +239,11 @@ const (
 	defaultGCTunerThreshold           = 0.6
 	minGCTunerThreshold               = 0
 	maxGCTunerThreshold               = 0.9
+
+	defaultWaitRegionSplitTimeout   = 30 * time.Second
+	defaultCheckRegionSplitInterval = 50 * time.Millisecond
+	minCheckRegionSplitInterval     = 1 * time.Millisecond
+	maxCheckRegionSplitInterval     = 100 * time.Millisecond
 )
 
 // Special keys for Labels
@@ -496,6 +502,8 @@ func (c *Config) Adjust(meta *toml.MetaData, reloading bool) error {
 
 	c.ReplicationMode.adjust(configMetaData.Child("replication-mode"))
 
+	c.Keyspace.adjust(configMetaData.Child("keyspace"))
+
 	c.Security.Encryption.Adjust()
 
 	if len(c.Log.Format) == 0 {
@@ -677,6 +685,10 @@ type ScheduleConfig struct {
 	// v1: which is based on the region count by rate limit.
 	// v2: which is based on region size by window size.
 	StoreLimitVersion string `toml:"store-limit-version" json:"store-limit-version,omitempty"`
+
+	// HaltScheduling is the option to halt the scheduling. Once it's on, PD will halt the scheduling,
+	// and any other scheduling configs will be ignored.
+	HaltScheduling bool `toml:"halt-scheduling" json:"halt-scheduling,string,omitempty"`
 }
 
 // Clone returns a cloned scheduling configuration.
@@ -811,6 +823,10 @@ func (c *ScheduleConfig) adjust(meta *configutil.ConfigMetaData, reloading bool)
 	// new cluster:v2, old cluster:v1
 	if !meta.IsDefined("region-score-formula-version") && !reloading {
 		configutil.AdjustString(&c.RegionScoreFormulaVersion, defaultRegionScoreFormulaVersion)
+	}
+
+	if !meta.IsDefined("halt-scheduling") {
+		c.HaltScheduling = defaultHaltScheduling
 	}
 
 	adjustSchedulers(&c.Schedulers, DefaultSchedulers)
@@ -1399,9 +1415,62 @@ func (c *DRAutoSyncReplicationConfig) adjust(meta *configutil.ConfigMetaData) {
 type KeyspaceConfig struct {
 	// PreAlloc contains the keyspace to be allocated during keyspace manager initialization.
 	PreAlloc []string `toml:"pre-alloc" json:"pre-alloc"`
+	// WaitRegionSplit indicates whether to wait for the region split to complete
+	WaitRegionSplit bool `toml:"wait-region-split" json:"wait-region-split"`
+	// WaitRegionSplitTimeout indicates the max duration to wait region split.
+	WaitRegionSplitTimeout typeutil.Duration `toml:"wait-region-split-timeout" json:"wait-region-split-timeout"`
+	// CheckRegionSplitInterval indicates the interval to check whether the region split is complete
+	CheckRegionSplitInterval typeutil.Duration `toml:"check-region-split-interval" json:"check-region-split-interval"`
+}
+
+// Validate checks if keyspace config falls within acceptable range.
+func (c *KeyspaceConfig) Validate() error {
+	if c.CheckRegionSplitInterval.Duration > maxCheckRegionSplitInterval || c.CheckRegionSplitInterval.Duration < minCheckRegionSplitInterval {
+		return errors.New(fmt.Sprintf("[keyspace] check-region-split-interval should between %v and %v",
+			minCheckRegionSplitInterval, maxCheckRegionSplitInterval))
+	}
+	if c.CheckRegionSplitInterval.Duration >= c.WaitRegionSplitTimeout.Duration {
+		return errors.New("[keyspace] check-region-split-interval should be less than wait-region-split-timeout")
+	}
+	return nil
+}
+
+func (c *KeyspaceConfig) adjust(meta *configutil.ConfigMetaData) {
+	if !meta.IsDefined("wait-region-split") {
+		c.WaitRegionSplit = true
+	}
+	if !meta.IsDefined("wait-region-split-timeout") {
+		c.WaitRegionSplitTimeout = typeutil.NewDuration(defaultWaitRegionSplitTimeout)
+	}
+	if !meta.IsDefined("check-region-split-interval") {
+		c.CheckRegionSplitInterval = typeutil.NewDuration(defaultCheckRegionSplitInterval)
+	}
+}
+
+// Clone makes a deep copy of the keyspace config.
+func (c *KeyspaceConfig) Clone() *KeyspaceConfig {
+	preAlloc := append(c.PreAlloc[:0:0], c.PreAlloc...)
+	cfg := *c
+	cfg.PreAlloc = preAlloc
+	return &cfg
 }
 
 // GetPreAlloc returns the keyspace to be allocated during keyspace manager initialization.
 func (c *KeyspaceConfig) GetPreAlloc() []string {
 	return c.PreAlloc
+}
+
+// ToWaitRegionSplit returns whether to wait for the region split to complete.
+func (c *KeyspaceConfig) ToWaitRegionSplit() bool {
+	return c.WaitRegionSplit
+}
+
+// GetWaitRegionSplitTimeout returns the max duration to wait region split.
+func (c *KeyspaceConfig) GetWaitRegionSplitTimeout() time.Duration {
+	return c.WaitRegionSplitTimeout.Duration
+}
+
+// GetCheckRegionSplitInterval returns the interval to check whether the region split is complete.
+func (c *KeyspaceConfig) GetCheckRegionSplitInterval() time.Duration {
+	return c.CheckRegionSplitInterval.Duration
 }

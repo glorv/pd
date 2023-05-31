@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"path"
@@ -45,22 +46,24 @@ import (
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/encryption"
 	"github.com/tikv/pd/pkg/errs"
+	"github.com/tikv/pd/pkg/gc"
 	"github.com/tikv/pd/pkg/id"
 	"github.com/tikv/pd/pkg/keyspace"
-	ms_server "github.com/tikv/pd/pkg/mcs/meta_storage/server"
+	ms_server "github.com/tikv/pd/pkg/mcs/metastorage/server"
 	"github.com/tikv/pd/pkg/mcs/registry"
-	rm_server "github.com/tikv/pd/pkg/mcs/resource_manager/server"
-	_ "github.com/tikv/pd/pkg/mcs/resource_manager/server/apis/v1" // init API group
-	_ "github.com/tikv/pd/pkg/mcs/tso/server/apis/v1"              // init tso API group
+	rm_server "github.com/tikv/pd/pkg/mcs/resourcemanager/server"
+	_ "github.com/tikv/pd/pkg/mcs/resourcemanager/server/apis/v1" // init API group
+	_ "github.com/tikv/pd/pkg/mcs/tso/server/apis/v1"             // init tso API group
 	mcs "github.com/tikv/pd/pkg/mcs/utils"
 	"github.com/tikv/pd/pkg/member"
 	"github.com/tikv/pd/pkg/ratelimit"
-	"github.com/tikv/pd/pkg/schedule"
 	"github.com/tikv/pd/pkg/schedule/hbstream"
 	"github.com/tikv/pd/pkg/schedule/placement"
+	"github.com/tikv/pd/pkg/schedule/schedulers"
 	"github.com/tikv/pd/pkg/storage"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
+	"github.com/tikv/pd/pkg/syncer"
 	"github.com/tikv/pd/pkg/systimemon"
 	"github.com/tikv/pd/pkg/tso"
 	"github.com/tikv/pd/pkg/utils/apiutil"
@@ -73,10 +76,9 @@ import (
 	"github.com/tikv/pd/pkg/versioninfo"
 	"github.com/tikv/pd/server/cluster"
 	"github.com/tikv/pd/server/config"
-	"github.com/tikv/pd/server/gc"
-	syncer "github.com/tikv/pd/server/region_syncer"
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/embed"
+	"go.etcd.io/etcd/mvcc/mvccpb"
 	"go.etcd.io/etcd/pkg/types"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -104,8 +106,9 @@ const (
 	maxRetryTimesGetServicePrimary = 25
 	// retryIntervalGetServicePrimary is the retry interval for getting primary addr.
 	retryIntervalGetServicePrimary = 100 * time.Millisecond
-	// TODO: move it to etcdutil
-	watchEtcdChangeRetryInterval = 1 * time.Second
+
+	lostPDLeaderMaxTimeoutSecs   = 10
+	lostPDLeaderReElectionFactor = 10
 )
 
 // EtcdStartTimeout the timeout of the startup etcd.
@@ -146,6 +149,8 @@ type Server struct {
 	member *member.EmbeddedEtcdMember
 	// etcd client
 	client *clientv3.Client
+	// electionClient is used for leader election.
+	electionClient *clientv3.Client
 	// http client
 	httpClient *http.Client
 	clusterID  uint64 // pd cluster id.
@@ -164,6 +169,8 @@ type Server struct {
 	gcSafePointManager *gc.SafePointManager
 	// keyspace manager
 	keyspaceManager *keyspace.Manager
+	// safe point V2 manager
+	safePointV2Manager *gc.SafePointV2Manager
 	// keyspace group manager
 	keyspaceGroupManager *keyspace.GroupManager
 	// for basicCluster operation.
@@ -217,9 +224,7 @@ type Server struct {
 	registry          *registry.ServiceRegistry
 	mode              string
 	servicePrimaryMap sync.Map /* Store as map[string]string */
-	// updateServicePrimaryAddrCh is used to notify the server to update the service primary address.
-	// Note: it is only used in API service mode.
-	updateServicePrimaryAddrCh chan struct{}
+	tsoPrimaryWatcher *etcdutil.LoopWatcher
 }
 
 // HandlerBuilder builds a server HTTP handler.
@@ -338,6 +343,11 @@ func (s *Server) startEtcd(ctx context.Context) error {
 		return err
 	}
 
+	s.electionClient, err = startElectionClient(s.cfg)
+	if err != nil {
+		return err
+	}
+
 	// update advertise peer urls.
 	etcdMembers, err := etcdutil.ListEtcdMembers(s.client)
 	if err != nil {
@@ -356,7 +366,7 @@ func (s *Server) startEtcd(ctx context.Context) error {
 	failpoint.Inject("memberNil", func() {
 		time.Sleep(1500 * time.Millisecond)
 	})
-	s.member = member.NewMember(etcd, s.client, etcdServerID)
+	s.member = member.NewMember(etcd, s.electionClient, etcdServerID)
 	return nil
 }
 
@@ -370,6 +380,19 @@ func startClient(cfg *config.Config) (*clientv3.Client, *http.Client, error) {
 		return nil, nil, err
 	}
 	return etcdutil.CreateClients(tlsConfig, etcdCfg.ACUrls[0])
+}
+
+func startElectionClient(cfg *config.Config) (*clientv3.Client, error) {
+	tlsConfig, err := cfg.Security.ToTLSConfig()
+	if err != nil {
+		return nil, err
+	}
+	etcdCfg, err := cfg.GenEmbedEtcdConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	return etcdutil.CreateEtcdClient(tlsConfig, etcdCfg.ACUrls[0])
 }
 
 // AddStartCallback adds a callback in the startServer phase.
@@ -443,7 +466,8 @@ func (s *Server) startServer(ctx context.Context) error {
 	if s.IsAPIServiceMode() {
 		s.keyspaceGroupManager = keyspace.NewKeyspaceGroupManager(s.ctx, s.storage, s.client, s.clusterID)
 	}
-	s.keyspaceManager = keyspace.NewKeyspaceManager(s.storage, s.cluster, keyspaceIDAllocator, &s.cfg.Keyspace, s.keyspaceGroupManager)
+	s.keyspaceManager = keyspace.NewKeyspaceManager(s.ctx, s.storage, s.cluster, keyspaceIDAllocator, &s.cfg.Keyspace, s.keyspaceGroupManager)
+	s.safePointV2Manager = gc.NewSafePointManagerV2(s.ctx, s.storage, s.storage, s.storage)
 	s.hbStreams = hbstream.NewHeartbeatStreams(ctx, s.clusterID, s.cluster)
 	// initial hot_region_storage in here.
 	s.hotRegionStorage, err = storage.NewHotRegionsStorage(
@@ -485,6 +509,11 @@ func (s *Server) Close() {
 	if s.client != nil {
 		if err := s.client.Close(); err != nil {
 			log.Error("close etcd client meet error", errs.ZapError(errs.ErrCloseEtcdClient, err))
+		}
+	}
+	if s.electionClient != nil {
+		if err := s.electionClient.Close(); err != nil {
+			log.Error("close election client meet error", errs.ZapError(errs.ErrCloseEtcdClient, err))
 		}
 	}
 
@@ -530,6 +559,9 @@ func (s *Server) Run() error {
 	if err := s.startEtcd(s.ctx); err != nil {
 		return err
 	}
+	failpoint.Inject("delayStartServer", func() {
+		time.Sleep(2 * time.Second)
+	})
 	if err := s.startServer(s.ctx); err != nil {
 		return err
 	}
@@ -566,9 +598,10 @@ func (s *Server) startServerLoop(ctx context.Context) {
 	go s.etcdLeaderLoop()
 	go s.serverMetricsLoop()
 	go s.encryptionKeyManagerLoop()
-	if s.IsAPIServiceMode() { // disable tso service in api server
+	if s.IsAPIServiceMode() {
+		s.initTSOPrimaryWatcher()
 		s.serverLoopWg.Add(1)
-		go s.startWatchServicePrimaryAddrLoop(mcs.TSOServiceName)
+		go s.tsoPrimaryWatcher.StartWatchLoop()
 	}
 }
 
@@ -820,6 +853,11 @@ func (s *Server) GetKeyspaceManager() *keyspace.Manager {
 	return s.keyspaceManager
 }
 
+// GetSafePointV2Manager returns the safe point v2 manager of server.
+func (s *Server) GetSafePointV2Manager() *gc.SafePointV2Manager {
+	return s.safePointV2Manager
+}
+
 // GetKeyspaceGroupManager returns the keyspace group manager of server.
 func (s *Server) GetKeyspaceGroupManager() *keyspace.GroupManager {
 	return s.keyspaceGroupManager
@@ -868,6 +906,7 @@ func (s *Server) GetConfig() *config.Config {
 	cfg.Replication = *s.persistOptions.GetReplicationConfig().Clone()
 	cfg.PDServerCfg = *s.persistOptions.GetPDServerConfig().Clone()
 	cfg.ReplicationMode = *s.persistOptions.GetReplicationModeConfig()
+	cfg.Keyspace = *s.persistOptions.GetKeyspaceConfig().Clone()
 	cfg.LabelProperty = s.persistOptions.GetLabelPropertyConfig().Clone()
 	cfg.ClusterVersion = *s.persistOptions.GetClusterVersion()
 	if s.storage == nil {
@@ -880,7 +919,7 @@ func (s *Server) GetConfig() *config.Config {
 	payload := make(map[string]interface{})
 	for i, sche := range sches {
 		var config interface{}
-		err := schedule.DecodeConfig([]byte(configs[i]), &config)
+		err := schedulers.DecodeConfig([]byte(configs[i]), &config)
 		if err != nil {
 			log.Error("failed to decode scheduler config",
 				zap.String("config", configs[i]),
@@ -892,6 +931,31 @@ func (s *Server) GetConfig() *config.Config {
 	}
 	cfg.Schedule.SchedulersPayload = payload
 	return cfg
+}
+
+// GetKeyspaceConfig gets the keyspace config information.
+func (s *Server) GetKeyspaceConfig() *config.KeyspaceConfig {
+	return s.persistOptions.GetKeyspaceConfig().Clone()
+}
+
+// SetKeyspaceConfig sets the keyspace config information.
+func (s *Server) SetKeyspaceConfig(cfg config.KeyspaceConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	old := s.persistOptions.GetKeyspaceConfig()
+	s.persistOptions.SetKeyspaceConfig(&cfg)
+	if err := s.persistOptions.Persist(s.storage); err != nil {
+		s.persistOptions.SetKeyspaceConfig(old)
+		log.Error("failed to update keyspace config",
+			zap.Reflect("new", cfg),
+			zap.Reflect("old", old),
+			errs.ZapError(err))
+		return err
+	}
+	s.keyspaceManager.UpdateConfig(&cfg)
+	log.Info("keyspace config is updated", zap.Reflect("new", cfg), zap.Reflect("old", old))
+	return nil
 }
 
 // GetScheduleConfig gets the balance config information.
@@ -1408,6 +1472,14 @@ func (s *Server) leaderLoop() {
 		}
 
 		leader, checkAgain := s.member.CheckLeader()
+		// add failpoint to test leader check go to stuck.
+		failpoint.Inject("leaderLoopCheckAgain", func(val failpoint.Value) {
+			memberString := val.(string)
+			memberID, _ := strconv.ParseUint(memberString, 10, 64)
+			if s.member.ID() == memberID {
+				checkAgain = true
+			}
+		})
 		if checkAgain {
 			continue
 		}
@@ -1435,6 +1507,25 @@ func (s *Server) leaderLoop() {
 		// To make sure the etcd leader and PD leader are on the same server.
 		etcdLeader := s.member.GetEtcdLeader()
 		if etcdLeader != s.member.ID() {
+			if s.member.GetLeader() == nil {
+				lastUpdated := s.member.GetLastLeaderUpdatedTime()
+				// use random timeout to avoid leader campaigning storm.
+				randomTimeout := time.Duration(rand.Intn(int(lostPDLeaderMaxTimeoutSecs)))*time.Second + lostPDLeaderMaxTimeoutSecs*time.Second + lostPDLeaderReElectionFactor*s.cfg.ElectionInterval.Duration
+				// add failpoint to test the campaign leader logic.
+				failpoint.Inject("timeoutWaitPDLeader", func() {
+					log.Info("timeoutWaitPDLeader is injected, skip wait other etcd leader be etcd leader")
+					randomTimeout = time.Duration(rand.Intn(10))*time.Millisecond + 100*time.Millisecond
+				})
+				if lastUpdated.Add(randomTimeout).Before(time.Now()) && !lastUpdated.IsZero() && etcdLeader != 0 {
+					log.Info("the pd leader is lost for a long time, try to re-campaign a pd leader with resign etcd leader",
+						zap.Duration("timeout", randomTimeout),
+						zap.Time("last-updated", lastUpdated),
+						zap.String("current-leader-member-id", types.ID(etcdLeader).String()),
+						zap.String("transferee-member-id", types.ID(s.member.ID()).String()),
+					)
+					s.member.MoveEtcdLeader(s.ctx, etcdLeader, s.member.ID())
+				}
+			}
 			log.Info("skip campaigning of pd leader and check later",
 				zap.String("server-name", s.Name()),
 				zap.Uint64("etcd-leader-id", etcdLeader),
@@ -1551,6 +1642,16 @@ func (s *Server) campaignLeader() {
 				log.Info("no longer a leader because lease has expired, pd leader will step down")
 				return
 			}
+			// add failpoint to test exit leader, failpoint judge the member is the give value, then break
+			failpoint.Inject("exitCampaignLeader", func(val failpoint.Value) {
+				memberString := val.(string)
+				memberID, _ := strconv.ParseUint(memberString, 10, 64)
+				if s.member.ID() == memberID {
+					log.Info("exit PD leader")
+					failpoint.Return()
+				}
+			})
+
 			etcdLeader := s.member.GetEtcdLeader()
 			if etcdLeader != s.member.ID() {
 				log.Info("etcd leader changed, resigns pd leadership", zap.String("old-pd-leader-name", s.Name()))
@@ -1591,6 +1692,7 @@ func (s *Server) reloadConfigFromKV() error {
 		return err
 	}
 	s.loadRateLimitConfig()
+	s.loadKeyspaceConfig()
 	useRegionStorage := s.persistOptions.IsUseRegionStorage()
 	regionStorage := storage.TrySwitchRegionStorage(s.storage, useRegionStorage)
 	if regionStorage != nil {
@@ -1601,6 +1703,11 @@ func (s *Server) reloadConfigFromKV() error {
 		}
 	}
 	return nil
+}
+
+func (s *Server) loadKeyspaceConfig() {
+	cfg := s.persistOptions.GetKeyspaceConfig()
+	s.keyspaceManager.UpdateConfig(cfg)
 }
 
 func (s *Server) loadRateLimitConfig() {
@@ -1722,126 +1829,45 @@ func (s *Server) GetServicePrimaryAddr(ctx context.Context, serviceName string) 
 	return "", false
 }
 
-// startWatchServicePrimaryAddrLoop starts a loop to watch the primary address of a given service.
-func (s *Server) startWatchServicePrimaryAddrLoop(serviceName string) {
-	defer logutil.LogPanic()
-	defer s.serverLoopWg.Done()
-	ctx, cancel := context.WithCancel(s.serverLoopCtx)
-	defer cancel()
-	s.updateServicePrimaryAddrCh = make(chan struct{}, 1)
-	serviceKey := s.servicePrimaryKey(serviceName)
-	var (
-		revision int64
-		err      error
-	)
-	for i := 0; i < maxRetryTimesGetServicePrimary; i++ {
-		revision, err = s.updateServicePrimaryAddr(serviceName)
-		if revision != 0 && err == nil { // update success
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(retryIntervalGetServicePrimary):
-		}
-	}
-	if err != nil {
-		log.Warn("service primary addr doesn't exist", zap.String("service-key", serviceKey), zap.Error(err))
-	}
-	log.Info("start to watch service primary addr", zap.String("service-key", serviceKey))
-	for {
-		select {
-		case <-ctx.Done():
-			log.Info("server is closed, exist watch service primary addr loop", zap.String("service", serviceName))
-			return
-		default:
-		}
-		nextRevision, err := s.watchServicePrimaryAddr(ctx, serviceName, revision)
-		if err != nil {
-			log.Error("watcher canceled unexpectedly and a new watcher will start after a while",
-				zap.Int64("next-revision", nextRevision),
-				zap.Time("retry-at", time.Now().Add(watchEtcdChangeRetryInterval)),
-				zap.Error(err))
-			revision = nextRevision
-			time.Sleep(watchEtcdChangeRetryInterval)
-		}
-	}
-}
-
-// watchServicePrimaryAddr watches the primary address on etcd.
-func (s *Server) watchServicePrimaryAddr(ctx context.Context, serviceName string, revision int64) (nextRevision int64, err error) {
-	serviceKey := s.servicePrimaryKey(serviceName)
-	watcher := clientv3.NewWatcher(s.client)
-	defer watcher.Close()
-
-	for {
-	WatchChan:
-		watchChan := watcher.Watch(s.serverLoopCtx, serviceKey, clientv3.WithRev(revision))
-		select {
-		case <-ctx.Done():
-			return revision, nil
-		case <-s.updateServicePrimaryAddrCh:
-			revision, err = s.updateServicePrimaryAddr(serviceName)
-			if err != nil {
-				log.Warn("update service primary addr failed", zap.String("service-key", serviceKey), zap.Error(err))
-			}
-			goto WatchChan
-		case wresp := <-watchChan:
-			if wresp.CompactRevision != 0 {
-				log.Warn("required revision has been compacted, use the compact revision",
-					zap.Int64("required-revision", revision),
-					zap.Int64("compact-revision", wresp.CompactRevision))
-				revision = wresp.CompactRevision
-				goto WatchChan
-			}
-			if wresp.Err() != nil {
-				log.Error("watcher is canceled with",
-					zap.Int64("revision", revision),
-					errs.ZapError(errs.ErrEtcdWatcherCancel, wresp.Err()))
-				return revision, wresp.Err()
-			}
-			for _, event := range wresp.Events {
-				switch event.Type {
-				case clientv3.EventTypePut:
-					primary := &tsopb.Participant{}
-					if err := proto.Unmarshal(event.Kv.Value, primary); err != nil {
-						log.Error("watch service primary addr failed", zap.String("service-key", serviceKey), zap.Error(err))
-					} else {
-						listenUrls := primary.GetListenUrls()
-						if len(listenUrls) > 0 {
-							// listenUrls[0] is the primary service endpoint of the keyspace group
-							s.servicePrimaryMap.Store(serviceName, listenUrls[0])
-						} else {
-							log.Warn("service primary addr doesn't exist", zap.String("service-key", serviceKey))
-						}
-					}
-				case clientv3.EventTypeDelete:
-					log.Warn("service primary is deleted", zap.String("service-key", serviceKey))
-					s.servicePrimaryMap.Delete(serviceName)
-				}
-			}
-			revision = wresp.Header.Revision + 1
-		}
-	}
-}
-
-// updateServicePrimaryAddr updates the primary address from etcd with get operation.
-func (s *Server) updateServicePrimaryAddr(serviceName string) (nextRevision int64, err error) {
-	serviceKey := s.servicePrimaryKey(serviceName)
-	primary := &tsopb.Participant{}
-	ok, revision, err := etcdutil.GetProtoMsgWithModRev(s.client, serviceKey, primary)
-	listenUrls := primary.GetListenUrls()
-	if !ok || err != nil || len(listenUrls) == 0 {
-		return 0, err
-	}
-	// listenUrls[0] is the primary service endpoint of the keyspace group
-	s.servicePrimaryMap.Store(serviceName, listenUrls[0])
-	log.Info("update service primary addr", zap.String("service-key", serviceKey), zap.String("primary-addr", listenUrls[0]))
-	return revision, nil
+// SetServicePrimaryAddr sets the primary address directly.
+// Note: This function is only used for test.
+func (s *Server) SetServicePrimaryAddr(serviceName, addr string) {
+	s.servicePrimaryMap.Store(serviceName, addr)
 }
 
 func (s *Server) servicePrimaryKey(serviceName string) string {
 	return fmt.Sprintf("/ms/%d/%s/%s/%s", s.clusterID, serviceName, fmt.Sprintf("%05d", 0), "primary")
+}
+
+func (s *Server) initTSOPrimaryWatcher() {
+	serviceName := mcs.TSOServiceName
+	tsoServicePrimaryKey := s.servicePrimaryKey(serviceName)
+	putFn := func(kv *mvccpb.KeyValue) error {
+		primary := &tsopb.Participant{} // TODO: use Generics
+		if err := proto.Unmarshal(kv.Value, primary); err != nil {
+			return err
+		}
+		listenUrls := primary.GetListenUrls()
+		if len(listenUrls) > 0 {
+			// listenUrls[0] is the primary service endpoint of the keyspace group
+			s.servicePrimaryMap.Store(serviceName, listenUrls[0])
+		}
+		return nil
+	}
+	deleteFn := func(kv *mvccpb.KeyValue) error {
+		s.servicePrimaryMap.Delete(serviceName)
+		return nil
+	}
+	s.tsoPrimaryWatcher = etcdutil.NewLoopWatcher(
+		s.serverLoopCtx,
+		&s.serverLoopWg,
+		s.client,
+		"tso-primary-watcher",
+		tsoServicePrimaryKey,
+		putFn,
+		deleteFn,
+		func() error { return nil },
+	)
 }
 
 // RecoverAllocID recover alloc id. set current base id to input id

@@ -17,17 +17,16 @@ package tso
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	perrors "github.com/pingcap/errors"
-	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/pingcap/log"
 	"github.com/tikv/pd/pkg/election"
@@ -43,19 +42,14 @@ import (
 	"github.com/tikv/pd/pkg/utils/memberutil"
 	"github.com/tikv/pd/pkg/utils/tsoutil"
 	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/mvcc/mvccpb"
 	"go.uber.org/zap"
 )
 
 const (
-	// primaryElectionSuffix is the suffix of the key for keyspace group primary election
-	primaryElectionSuffix = "primary"
-	// defaultLoadKeyspaceGroupsTimeout is the default timeout for loading the initial
-	// keyspace group assignment
-	defaultLoadKeyspaceGroupsTimeout   = 30 * time.Second
-	defaultLoadKeyspaceGroupsBatchSize = int64(400)
-	defaultLoadFromEtcdRetryInterval   = 500 * time.Millisecond
-	defaultLoadFromEtcdMaxRetryTimes   = int(defaultLoadKeyspaceGroupsTimeout / defaultLoadFromEtcdRetryInterval)
-	watchEtcdChangeRetryInterval       = 1 * time.Second
+	keyspaceGroupsElectionPath = mcsutils.KeyspaceGroupsKey + "/election"
+	// primaryKey is the key for keyspace group primary election.
+	primaryKey = "primary"
 )
 
 type state struct {
@@ -154,6 +148,32 @@ func (s *state) getKeyspaceGroupMetaWithCheck(
 		mcsutils.DefaultKeyspaceGroupID, nil
 }
 
+// kgPrimaryPathBuilder builds the path for keyspace group primary election.
+// default keyspace group: "/ms/{cluster_id}/tso/00000/primary".
+// non-default keyspace group: "/ms/{cluster_id}/tso/keyspace_groups/election/{group}/primary".
+type kgPrimaryPathBuilder struct {
+	// rootPath is "/ms/{cluster_id}/tso".
+	rootPath string
+	// defaultKeyspaceGroupIDPath is "/ms/{cluster_id}/tso/00000".
+	defaultKeyspaceGroupIDPath string
+}
+
+// getKeyspaceGroupIDPath returns the keyspace group primary ID path.
+// default keyspace group: "/ms/{cluster_id}/tso/00000".
+// non-default keyspace group: "/ms/{cluster_id}/tso/keyspace_groups/election/{group}".
+func (p *kgPrimaryPathBuilder) getKeyspaceGroupIDPath(keyspaceGroupID uint32) string {
+	if keyspaceGroupID == mcsutils.DefaultKeyspaceGroupID {
+		return p.defaultKeyspaceGroupIDPath
+	}
+	return path.Join(p.rootPath, keyspaceGroupsElectionPath, fmt.Sprintf("%05d", keyspaceGroupID))
+}
+
+// getCompiledNonDefaultIDRegexp returns the compiled regular expression for matching non-default keyspace group id.
+func (p *kgPrimaryPathBuilder) getCompiledNonDefaultIDRegexp() *regexp.Regexp {
+	pattern := strings.Join([]string{p.rootPath, keyspaceGroupsElectionPath, `(\d{5})`, primaryKey + `$`}, "/")
+	return regexp.MustCompile(pattern)
+}
+
 // KeyspaceGroupManager manages the members of the keyspace groups assigned to this host.
 // The replicas campaign for the leaders which provide the tso service for the corresponding
 // keyspace groups.
@@ -190,12 +210,14 @@ type KeyspaceGroupManager struct {
 	// tsoSvcRootPath defines the root path for all etcd paths used in the tso microservices.
 	// It is in the format of "/ms/<cluster-id>/tso".
 	// The main paths for different usages include:
-	// 1. The path for keyspace group primary election. Format: "/ms/{cluster_id}/tso/{group}/primary"
+	// 1. The path for keyspace group primary election.
+	//    default keyspace group: "/ms/{cluster_id}/tso/00000/primary".
+	//    non-default keyspace group: "/ms/{cluster_id}/tso/keyspace_groups/election/{group}/primary".
 	// 2. The path for LoadTimestamp/SaveTimestamp in the storage endpoint for all the non-default
 	//    keyspace groups.
-	//    Key: /ms/{cluster_id}/tso/{group}/gts/timestamp
+	//    Key: /ms/{cluster_id}/tso/{group}/gta/timestamp
 	//    Value: ts(time.Time)
-	//    Key: /ms/{cluster_id}/tso/{group}/lts/{dc-location}/timestamp
+	//    Key: /ms/{cluster_id}/tso/{group}/lta/{dc-location}/timestamp
 	//    Value: ts(time.Time)
 	// Note: The {group} is 5 digits integer with leading zeros.
 	tsoSvcRootPath string
@@ -205,13 +227,20 @@ type KeyspaceGroupManager struct {
 	tsoSvcStorage *endpoint.StorageEndpoint
 	// cfg is the TSO config
 	cfg ServiceConfig
+
 	// loadKeyspaceGroupsTimeout is the timeout for loading the initial keyspace group assignment.
 	loadKeyspaceGroupsTimeout   time.Duration
 	loadKeyspaceGroupsBatchSize int64
 	loadFromEtcdMaxRetryTimes   int
 
+	// compiledKGMembershipIDRegexp is the compiled regular expression for matching keyspace group id in the
+	// keyspace group membership path.
+	compiledKGMembershipIDRegexp *regexp.Regexp
 	// groupUpdateRetryList is the list of keyspace groups which failed to update and need to retry.
 	groupUpdateRetryList map[uint32]*endpoint.KeyspaceGroup
+	groupWatcher         *etcdutil.LoopWatcher
+
+	primaryPathBuilder *kgPrimaryPathBuilder
 }
 
 // NewKeyspaceGroupManager creates a new Keyspace Group Manager.
@@ -233,44 +262,96 @@ func NewKeyspaceGroupManager(
 
 	ctx, cancel := context.WithCancel(ctx)
 	kgm := &KeyspaceGroupManager{
-		ctx:                         ctx,
-		cancel:                      cancel,
-		tsoServiceID:                tsoServiceID,
-		etcdClient:                  etcdClient,
-		httpClient:                  httpClient,
-		electionNamePrefix:          electionNamePrefix,
-		legacySvcRootPath:           legacySvcRootPath,
-		tsoSvcRootPath:              tsoSvcRootPath,
-		cfg:                         cfg,
-		loadKeyspaceGroupsTimeout:   defaultLoadKeyspaceGroupsTimeout,
-		loadKeyspaceGroupsBatchSize: defaultLoadKeyspaceGroupsBatchSize,
-		loadFromEtcdMaxRetryTimes:   defaultLoadFromEtcdMaxRetryTimes,
-		groupUpdateRetryList:        make(map[uint32]*endpoint.KeyspaceGroup),
+		ctx:                  ctx,
+		cancel:               cancel,
+		tsoServiceID:         tsoServiceID,
+		etcdClient:           etcdClient,
+		httpClient:           httpClient,
+		electionNamePrefix:   electionNamePrefix,
+		legacySvcRootPath:    legacySvcRootPath,
+		tsoSvcRootPath:       tsoSvcRootPath,
+		cfg:                  cfg,
+		groupUpdateRetryList: make(map[uint32]*endpoint.KeyspaceGroup),
 	}
 	kgm.legacySvcStorage = endpoint.NewStorageEndpoint(
 		kv.NewEtcdKVBase(kgm.etcdClient, kgm.legacySvcRootPath), nil)
 	kgm.tsoSvcStorage = endpoint.NewStorageEndpoint(
 		kv.NewEtcdKVBase(kgm.etcdClient, kgm.tsoSvcRootPath), nil)
+	kgm.compiledKGMembershipIDRegexp = endpoint.GetCompiledKeyspaceGroupIDRegexp()
+	kgm.primaryPathBuilder = &kgPrimaryPathBuilder{
+		rootPath:                   kgm.tsoSvcRootPath,
+		defaultKeyspaceGroupIDPath: path.Join(kgm.tsoSvcRootPath, "00000"),
+	}
 	kgm.state.initialize()
 	return kgm
 }
 
 // Initialize this KeyspaceGroupManager
 func (kgm *KeyspaceGroupManager) Initialize() error {
-	// Load the initial keyspace group assignment from storage with time limit
-	done := make(chan struct{}, 1)
-	ctx, cancel := context.WithCancel(kgm.ctx)
-	go kgm.checkInitProgress(ctx, cancel, done)
-	watchStartRevision, defaultKGConfigured, err := kgm.initAssignment(ctx)
-	done <- struct{}{}
-	if err != nil {
+	rootPath := kgm.legacySvcRootPath
+	startKey := strings.Join([]string{rootPath, endpoint.KeyspaceGroupIDPath(mcsutils.DefaultKeyspaceGroupID)}, "/")
+	endKey := strings.Join(
+		[]string{rootPath, clientv3.GetPrefixRangeEnd(endpoint.KeyspaceGroupIDPrefix())}, "/")
+
+	defaultKGConfigured := false
+	putFn := func(kv *mvccpb.KeyValue) error {
+		group := &endpoint.KeyspaceGroup{}
+		if err := json.Unmarshal(kv.Value, group); err != nil {
+			return errs.ErrJSONUnmarshal.Wrap(err).FastGenWithCause()
+		}
+		kgm.updateKeyspaceGroup(group)
+		if group.ID == mcsutils.DefaultKeyspaceGroupID {
+			defaultKGConfigured = true
+		}
+		return nil
+	}
+	deleteFn := func(kv *mvccpb.KeyValue) error {
+		groupID, err := ExtractKeyspaceGroupIDFromPath(kgm.compiledKGMembershipIDRegexp, string(kv.Key))
+		if err != nil {
+			return err
+		}
+		kgm.deleteKeyspaceGroup(groupID)
+		return nil
+	}
+	postEventFn := func() error {
+		// Retry the groups that are not initialized successfully before.
+		for id, group := range kgm.groupUpdateRetryList {
+			delete(kgm.groupUpdateRetryList, id)
+			kgm.updateKeyspaceGroup(group)
+		}
+		return nil
+	}
+	kgm.groupWatcher = etcdutil.NewLoopWatcher(
+		kgm.ctx,
+		&kgm.wg,
+		kgm.etcdClient,
+		"keyspace-watcher",
+		startKey,
+		putFn,
+		deleteFn,
+		postEventFn,
+		clientv3.WithRange(endKey),
+	)
+	if kgm.loadKeyspaceGroupsTimeout > 0 {
+		kgm.groupWatcher.SetLoadTimeout(kgm.loadKeyspaceGroupsTimeout)
+	}
+	if kgm.loadFromEtcdMaxRetryTimes > 0 {
+		kgm.groupWatcher.SetLoadRetryTimes(kgm.loadFromEtcdMaxRetryTimes)
+	}
+	if kgm.loadKeyspaceGroupsBatchSize > 0 {
+		kgm.groupWatcher.SetLoadBatchSize(kgm.loadKeyspaceGroupsBatchSize)
+	}
+
+	kgm.wg.Add(1)
+	go kgm.groupWatcher.StartWatchLoop()
+
+	if err := kgm.groupWatcher.WaitLoad(); err != nil {
 		log.Error("failed to initialize keyspace group manager", errs.ZapError(err))
 		// We might have partially loaded/initialized the keyspace groups. Close the manager to clean up.
 		kgm.Close()
-		return err
+		return errs.ErrLoadKeyspaceGroupsTerminated.Wrap(err)
 	}
 
-	// Initialize the default keyspace group if it isn't configured in the storage.
 	if !defaultKGConfigured {
 		log.Info("initializing default keyspace group")
 		group := &endpoint.KeyspaceGroup{
@@ -280,12 +361,6 @@ func (kgm *KeyspaceGroupManager) Initialize() error {
 		}
 		kgm.updateKeyspaceGroup(group)
 	}
-
-	// Watch/apply keyspace group membership/distribution meta changes dynamically.
-	kgm.wg.Add(1)
-	go kgm.startKeyspaceGroupsMetaWatchLoop(watchStartRevision)
-
-	log.Info("keyspace group manager initialized")
 	return nil
 }
 
@@ -303,222 +378,6 @@ func (kgm *KeyspaceGroupManager) Close() {
 	kgm.state.deinitialize()
 
 	log.Info("keyspace group manager closed")
-}
-
-func (kgm *KeyspaceGroupManager) checkInitProgress(ctx context.Context, cancel context.CancelFunc, done chan struct{}) {
-	defer logutil.LogPanic()
-
-	select {
-	case <-done:
-		return
-	case <-time.After(kgm.loadKeyspaceGroupsTimeout):
-		log.Error("failed to initialize keyspace group manager",
-			zap.Any("timeout-setting", kgm.loadKeyspaceGroupsTimeout),
-			errs.ZapError(errs.ErrLoadKeyspaceGroupsTimeout))
-		cancel()
-	case <-ctx.Done():
-	}
-	<-done
-}
-
-// initAssignment loads initial keyspace group assignment from storage and initialize the group manager.
-// Return watchStartRevision, the start revision for watching keyspace group membership/distribution change.
-func (kgm *KeyspaceGroupManager) initAssignment(
-	ctx context.Context,
-) (watchStartRevision int64, defaultKGConfigured bool, err error) {
-	var (
-		groups               []*endpoint.KeyspaceGroup
-		more                 bool
-		keyspaceGroupsLoaded uint32
-		revision             int64
-	)
-
-	// Load all keyspace groups from etcd and apply the ones assigned to this tso service.
-	for {
-		revision, groups, more, err = kgm.loadKeyspaceGroups(ctx, keyspaceGroupsLoaded, kgm.loadKeyspaceGroupsBatchSize)
-		if err != nil {
-			return
-		}
-
-		keyspaceGroupsLoaded += uint32(len(groups))
-
-		if watchStartRevision == 0 || revision < watchStartRevision {
-			watchStartRevision = revision
-		}
-
-		// Update the keyspace groups
-		for _, group := range groups {
-			select {
-			case <-ctx.Done():
-				err = errs.ErrLoadKeyspaceGroupsTerminated
-				return
-			default:
-			}
-
-			if group.ID == mcsutils.DefaultKeyspaceGroupID {
-				defaultKGConfigured = true
-			}
-
-			kgm.updateKeyspaceGroup(group)
-		}
-
-		if !more {
-			break
-		}
-	}
-
-	log.Info("loaded keyspace groups", zap.Uint32("keyspace-groups-loaded", keyspaceGroupsLoaded))
-	return
-}
-
-// loadKeyspaceGroups loads keyspace groups from the start ID with limit.
-// If limit is 0, it will load all keyspace groups from the start ID.
-func (kgm *KeyspaceGroupManager) loadKeyspaceGroups(
-	ctx context.Context, startID uint32, limit int64,
-) (revision int64, ksgs []*endpoint.KeyspaceGroup, more bool, err error) {
-	rootPath := kgm.legacySvcRootPath
-	startKey := strings.Join([]string{rootPath, endpoint.KeyspaceGroupIDPath(startID)}, "/")
-	endKey := strings.Join(
-		[]string{rootPath, clientv3.GetPrefixRangeEnd(endpoint.KeyspaceGroupIDPrefix())}, "/")
-	opOption := []clientv3.OpOption{clientv3.WithRange(endKey), clientv3.WithLimit(limit)}
-
-	var (
-		i    int
-		resp *clientv3.GetResponse
-	)
-	for ; i < kgm.loadFromEtcdMaxRetryTimes; i++ {
-		resp, err = etcdutil.EtcdKVGet(kgm.etcdClient, startKey, opOption...)
-
-		failpoint.Inject("delayLoadKeyspaceGroups", func(val failpoint.Value) {
-			if sleepIntervalSeconds, ok := val.(int); ok && sleepIntervalSeconds > 0 {
-				time.Sleep(time.Duration(sleepIntervalSeconds) * time.Second)
-			}
-		})
-
-		failpoint.Inject("loadKeyspaceGroupsTemporaryFail", func(val failpoint.Value) {
-			if maxFailTimes, ok := val.(int); ok && i < maxFailTimes {
-				err = errors.New("fail to read from etcd")
-				failpoint.Continue()
-			}
-		})
-
-		if err == nil && resp != nil {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return 0, []*endpoint.KeyspaceGroup{}, false, errs.ErrLoadKeyspaceGroupsTerminated
-		case <-time.After(defaultLoadFromEtcdRetryInterval):
-		}
-	}
-
-	if i == kgm.loadFromEtcdMaxRetryTimes {
-		return 0, []*endpoint.KeyspaceGroup{}, false, errs.ErrLoadKeyspaceGroupsRetryExhausted.FastGenByArgs(err)
-	}
-
-	kgs := make([]*endpoint.KeyspaceGroup, 0, len(resp.Kvs))
-	for _, item := range resp.Kvs {
-		kg := &endpoint.KeyspaceGroup{}
-		if err = json.Unmarshal(item.Value, kg); err != nil {
-			return 0, nil, false, err
-		}
-		kgs = append(kgs, kg)
-	}
-
-	if resp.Header != nil {
-		revision = resp.Header.Revision + 1
-	}
-
-	return revision, kgs, resp.More, nil
-}
-
-// startKeyspaceGroupsMetaWatchLoop repeatedly watches any change in keyspace group membership/distribution
-// and apply the change dynamically.
-func (kgm *KeyspaceGroupManager) startKeyspaceGroupsMetaWatchLoop(revision int64) {
-	defer logutil.LogPanic()
-	defer kgm.wg.Done()
-
-	// Repeatedly watch/apply keyspace group membership/distribution changes until the context is canceled.
-	for {
-		select {
-		case <-kgm.ctx.Done():
-			return
-		default:
-		}
-
-		nextRevision, err := kgm.watchKeyspaceGroupsMetaChange(revision)
-		if err != nil {
-			log.Error("watcher canceled unexpectedly and a new watcher will start after a while",
-				zap.Int64("next-revision", nextRevision),
-				zap.Time("retry-at", time.Now().Add(watchEtcdChangeRetryInterval)),
-				zap.Error(err))
-			time.Sleep(watchEtcdChangeRetryInterval)
-		}
-	}
-}
-
-// watchKeyspaceGroupsMetaChange watches any change in keyspace group membership/distribution
-// and apply the change dynamically.
-func (kgm *KeyspaceGroupManager) watchKeyspaceGroupsMetaChange(revision int64) (int64, error) {
-	watcher := clientv3.NewWatcher(kgm.etcdClient)
-	defer watcher.Close()
-
-	ksgPrefix := strings.Join([]string{kgm.legacySvcRootPath, endpoint.KeyspaceGroupIDPrefix()}, "/")
-	log.Info("start to watch keyspace group meta change", zap.Int64("revision", revision), zap.String("prefix", ksgPrefix))
-
-	for {
-		watchChan := watcher.Watch(kgm.ctx, ksgPrefix, clientv3.WithPrefix(), clientv3.WithRev(revision))
-		for wresp := range watchChan {
-			if wresp.CompactRevision != 0 {
-				log.Warn("Required revision has been compacted, the watcher will watch again with the compact revision",
-					zap.Int64("required-revision", revision),
-					zap.Int64("compact-revision", wresp.CompactRevision))
-				revision = wresp.CompactRevision
-				break
-			}
-			if wresp.Err() != nil {
-				log.Error("watch is canceled or closed",
-					zap.Int64("required-revision", revision),
-					errs.ZapError(errs.ErrEtcdWatcherCancel, wresp.Err()))
-				return revision, wresp.Err()
-			}
-			for _, event := range wresp.Events {
-				groupID, err := endpoint.ExtractKeyspaceGroupIDFromPath(string(event.Kv.Key))
-				if err != nil {
-					log.Warn("failed to extract keyspace group ID from the key path",
-						zap.String("key-path", string(event.Kv.Key)), zap.Error(err))
-					continue
-				}
-
-				switch event.Type {
-				case clientv3.EventTypePut:
-					group := &endpoint.KeyspaceGroup{}
-					if err := json.Unmarshal(event.Kv.Value, group); err != nil {
-						log.Warn("failed to unmarshal keyspace group",
-							zap.Uint32("keyspace-group-id", groupID),
-							zap.Error(errs.ErrJSONUnmarshal.Wrap(err).FastGenWithCause()))
-						break
-					}
-					kgm.updateKeyspaceGroup(group)
-				case clientv3.EventTypeDelete:
-					kgm.deleteKeyspaceGroup(groupID)
-				}
-			}
-			// Retry the groups that are not initialized successfully before.
-			for id, group := range kgm.groupUpdateRetryList {
-				delete(kgm.groupUpdateRetryList, id)
-				kgm.updateKeyspaceGroup(group)
-			}
-			revision = wresp.Header.Revision + 1
-		}
-
-		select {
-		case <-kgm.ctx.Done():
-			return revision, nil
-		default:
-		}
-	}
 }
 
 func (kgm *KeyspaceGroupManager) isAssignedToMe(group *endpoint.KeyspaceGroup) bool {
@@ -540,8 +399,6 @@ func (kgm *KeyspaceGroupManager) updateKeyspaceGroup(group *endpoint.KeyspaceGro
 
 	// If the default keyspace group isn't assigned to any tso node/pod, assign it to everyone.
 	if group.ID == mcsutils.DefaultKeyspaceGroupID && len(group.Members) == 0 {
-		log.Warn("configured the default keyspace group but no members/distribution specified. " +
-			"ignore it for now and fallback to the way of every tso node/pod owning a replica")
 		// TODO: fill members with all tso nodes/pods.
 		group.Members = []endpoint.KeyspaceGroupMember{{Address: kgm.tsoServiceID.ServiceAddr}}
 	}
@@ -553,10 +410,9 @@ func (kgm *KeyspaceGroupManager) updateKeyspaceGroup(group *endpoint.KeyspaceGro
 		return
 	}
 
-	// If this host is already assigned a replica of this keyspace group, that is to is already initialized, just update the meta.
+	// If this host is already assigned a replica of this keyspace group, i.e., the election member
+	// is already initialized, just update the meta.
 	if oldAM, oldGroup := kgm.getKeyspaceGroupMeta(group.ID); oldAM != nil {
-		log.Info("keyspace group already initialized, so update meta only",
-			zap.Uint32("keyspace-group-id", group.ID))
 		kgm.updateKeyspaceGroupMembership(oldGroup, group, true)
 		return
 	}
@@ -571,8 +427,8 @@ func (kgm *KeyspaceGroupManager) updateKeyspaceGroup(group *endpoint.KeyspaceGro
 	// Initialize the participant info to join the primary election.
 	participant := member.NewParticipant(kgm.etcdClient)
 	participant.InitInfo(
-		uniqueName, uniqueID, path.Join(kgm.tsoSvcRootPath, fmt.Sprintf("%05d", group.ID)),
-		primaryElectionSuffix, "keyspace group primary election", kgm.cfg.GetAdvertiseListenAddr())
+		uniqueName, uniqueID, kgm.primaryPathBuilder.getKeyspaceGroupIDPath(group.ID),
+		primaryKey, "keyspace group primary election", kgm.cfg.GetAdvertiseListenAddr())
 	// If the keyspace group is in split, we should ensure that the primary elected by the new keyspace group
 	// is always on the same TSO Server node as the primary of the old keyspace group, and this constraint cannot
 	// be broken until the entire split process is completed.
@@ -605,6 +461,9 @@ func (kgm *KeyspaceGroupManager) updateKeyspaceGroup(group *endpoint.KeyspaceGro
 	}
 	// Initialize all kinds of maps.
 	am := NewAllocatorManager(kgm.ctx, group.ID, participant, tsRootPath, storage, kgm.cfg, true)
+	log.Info("created allocator manager",
+		zap.Uint32("keyspace-group-id", group.ID),
+		zap.String("timestamp-path", am.GetTimestampPath("")))
 	kgm.Lock()
 	group.KeyspaceLookupTable = make(map[uint32]struct{})
 	for _, kid := range group.Keyspaces {
@@ -690,6 +549,12 @@ func (kgm *KeyspaceGroupManager) updateKeyspaceGroupMembership(
 		// The keyspace group membership is not changed. Reuse the old one.
 		newGroup.KeyspaceLookupTable = oldKeyspaceLookupTable
 	} else {
+		// The keyspace list might be too long, so we only log the length, though there is a rare case that
+		// the old length and the new length are the same but the keyspace list is changed.
+		log.Info("the keyspace group's keyspace list is changed",
+			zap.Uint32("keyspace-group-id", groupID),
+			zap.Int("old-keyspaces-count", oldLen),
+			zap.Int("new-keyspaces-count", newLen))
 		// The keyspace group membership is changed. Update the keyspace lookup table.
 		newGroup.KeyspaceLookupTable = make(map[uint32]struct{})
 		for i, j := 0, 0; i < oldLen || j < newLen; {
@@ -812,7 +677,7 @@ func (kgm *KeyspaceGroupManager) FindGroupByKeyspaceID(
 	return curAM, curKeyspaceGroup, curKeyspaceGroupID, nil
 }
 
-// GetElectionMember returns the election member of the given keyspace group
+// GetElectionMember returns the election member of the keyspace group serving the given keyspace.
 func (kgm *KeyspaceGroupManager) GetElectionMember(
 	keyspaceID, keyspaceGroupID uint32,
 ) (ElectionMember, error) {
@@ -824,6 +689,20 @@ func (kgm *KeyspaceGroupManager) GetElectionMember(
 		return nil, err
 	}
 	return am.GetMember(), nil
+}
+
+// GetKeyspaceGroups returns all keyspace groups managed by the current keyspace group manager.
+func (kgm *KeyspaceGroupManager) GetKeyspaceGroups() map[uint32]*endpoint.KeyspaceGroup {
+	kgm.RLock()
+	defer kgm.RUnlock()
+	keyspaceGroups := make(map[uint32]*endpoint.KeyspaceGroup)
+	for _, keyspaceGroupID := range kgm.keyspaceLookupTable {
+		if _, ok := keyspaceGroups[keyspaceGroupID]; ok {
+			continue
+		}
+		keyspaceGroups[keyspaceGroupID] = kgm.kgs[keyspaceGroupID]
+	}
+	return keyspaceGroups
 }
 
 // HandleTSORequest forwards TSO allocation requests to correct TSO Allocators of the given keyspace group.
@@ -852,6 +731,52 @@ func (kgm *KeyspaceGroupManager) checkKeySpaceGroupID(id uint32) error {
 	}
 	return errs.ErrKeyspaceGroupIDInvalid.FastGenByArgs(
 		fmt.Sprintf("%d shouldn't >= %d", id, mcsutils.MaxKeyspaceGroupCountInUse))
+}
+
+// GetMinTS returns the minimum timestamp across all keyspace groups served by this TSO server/pod.
+func (kgm *KeyspaceGroupManager) GetMinTS(
+	dcLocation string,
+) (_ pdpb.Timestamp, kgAskedCount, kgTotalCount uint32, err error) {
+	kgm.RLock()
+	defer kgm.RUnlock()
+
+	var minTS *pdpb.Timestamp
+	for i, am := range kgm.ams {
+		if kgm.kgs[i] != nil {
+			kgTotalCount++
+		}
+		// If any keyspace group hasn't elected primary, we can't know its current timestamp of
+		// the group, so as to the min ts across all keyspace groups. Return error in this case.
+		if am != nil && !am.member.IsLeaderElected() {
+			return pdpb.Timestamp{}, kgAskedCount, kgTotalCount, errs.ErrGetMinTS.FastGenByArgs("leader is not elected")
+		}
+		// Skip the keyspace groups that are not served by this TSO Server/Pod.
+		if am == nil || !am.IsLeader() {
+			continue
+		}
+		kgAskedCount++
+		// Skip the keyspace groups that are split targets, because they always have newer
+		// time lines than the existing split sources thus won't contribute to the min ts.
+		if kgm.kgs[i] != nil && kgm.kgs[i].IsSplitTarget() {
+			continue
+		}
+		ts, err := am.HandleRequest(dcLocation, 1)
+		if err != nil {
+			return pdpb.Timestamp{}, kgAskedCount, kgTotalCount, err
+		}
+		if minTS == nil || tsoutil.CompareTimestamp(&ts, minTS) < 0 {
+			minTS = &ts
+		}
+	}
+
+	if minTS == nil {
+		// This TSO server/pod is not serving any keyspace group, return an empty timestamp,
+		// and the client needs to skip the empty timestamps when collecting the min timestamp
+		// from all TSO servers/pods.
+		return pdpb.Timestamp{}, kgAskedCount, kgTotalCount, nil
+	}
+
+	return *minTS, kgAskedCount, kgTotalCount, nil
 }
 
 func genNotServedErr(perr *perrors.Error, keyspaceGroupID uint32) error {

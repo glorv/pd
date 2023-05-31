@@ -21,14 +21,14 @@ import (
 	"time"
 
 	"github.com/pingcap/log"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	pd "github.com/tikv/pd/client"
 	bs "github.com/tikv/pd/pkg/basicserver"
-	rm "github.com/tikv/pd/pkg/mcs/resource_manager/server"
+	rm "github.com/tikv/pd/pkg/mcs/resourcemanager/server"
 	tso "github.com/tikv/pd/pkg/mcs/tso/server"
 	"github.com/tikv/pd/pkg/utils/logutil"
 	"github.com/tikv/pd/pkg/utils/testutil"
+	"github.com/tikv/pd/pkg/utils/tsoutil"
 )
 
 var once sync.Once
@@ -48,9 +48,21 @@ func InitLogger(cfg *tso.Config) (err error) {
 	return err
 }
 
-// SetupClientWithKeyspace creates a TSO client for test.
-func SetupClientWithKeyspace(ctx context.Context, re *require.Assertions, endpoints []string, opts ...pd.ClientOption) pd.Client {
-	cli, err := pd.NewClientWithKeyspaceName(ctx, "", endpoints, pd.SecurityOption{}, opts...)
+// SetupClientWithAPIContext creates a TSO client with api context name for test.
+func SetupClientWithAPIContext(
+	ctx context.Context, re *require.Assertions, apiCtx pd.APIContext, endpoints []string, opts ...pd.ClientOption,
+) pd.Client {
+	cli, err := pd.NewClientWithAPIContext(ctx, apiCtx, endpoints, pd.SecurityOption{}, opts...)
+	re.NoError(err)
+	return cli
+}
+
+// SetupClientWithKeyspaceID creates a TSO client with the given keyspace id for test.
+func SetupClientWithKeyspaceID(
+	ctx context.Context, re *require.Assertions,
+	keyspaceID uint32, endpoints []string, opts ...pd.ClientOption,
+) pd.Client {
+	cli, err := pd.NewClientWithKeyspace(ctx, keyspaceID, endpoints, pd.SecurityOption{}, opts...)
 	re.NoError(err)
 	return cli
 }
@@ -72,19 +84,22 @@ func StartSingleResourceManagerTestServer(ctx context.Context, re *require.Asser
 	return s, cleanup
 }
 
-// StartSingleTSOTestServer creates and starts a tso server with default config for testing.
-func StartSingleTSOTestServer(ctx context.Context, re *require.Assertions, backendEndpoints, listenAddrs string) (*tso.Server, func()) {
+// StartSingleTSOTestServerWithoutCheck creates and starts a tso server with default config for testing.
+func StartSingleTSOTestServerWithoutCheck(ctx context.Context, re *require.Assertions, backendEndpoints, listenAddrs string) (*tso.Server, func(), error) {
 	cfg := tso.NewConfig()
 	cfg.BackendEndpoints = backendEndpoints
 	cfg.ListenAddr = listenAddrs
 	cfg, err := tso.GenerateConfig(cfg)
 	re.NoError(err)
-
 	// Setup the logger.
 	err = InitLogger(cfg)
 	re.NoError(err)
+	return NewTSOTestServer(ctx, cfg)
+}
 
-	s, cleanup, err := NewTSOTestServer(ctx, cfg)
+// StartSingleTSOTestServer creates and starts a tso server with default config for testing.
+func StartSingleTSOTestServer(ctx context.Context, re *require.Assertions, backendEndpoints, listenAddrs string) (*tso.Server, func()) {
+	s, cleanup, err := StartSingleTSOTestServerWithoutCheck(ctx, re, backendEndpoints, listenAddrs)
 	re.NoError(err)
 	testutil.Eventually(re, func() bool {
 		return !s.IsClosed()
@@ -123,17 +138,81 @@ func WaitForPrimaryServing(re *require.Assertions, serverMap map[string]bs.Serve
 }
 
 // WaitForTSOServiceAvailable waits for the pd client being served by the tso server side
-func WaitForTSOServiceAvailable(ctx context.Context, pdClient pd.Client) error {
-	var err error
-	for i := 0; i < 30; i++ {
-		if _, _, err := pdClient.GetTS(ctx); err == nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return err
-		case <-time.After(100 * time.Millisecond):
-		}
+func WaitForTSOServiceAvailable(
+	ctx context.Context, re *require.Assertions, client pd.Client,
+) {
+	testutil.Eventually(re, func() bool {
+		_, _, err := client.GetTS(ctx)
+		return err == nil
+	})
+}
+
+// CheckMultiKeyspacesTSO checks the correctness of TSO for multiple keyspaces.
+func CheckMultiKeyspacesTSO(
+	ctx context.Context, re *require.Assertions,
+	clients []pd.Client, parallelAct func(),
+) {
+	ctx, cancel := context.WithCancel(ctx)
+	wg := sync.WaitGroup{}
+	wg.Add(len(clients))
+
+	for _, client := range clients {
+		go func(cli pd.Client) {
+			defer wg.Done()
+			var ts, lastTS uint64
+			for {
+				select {
+				case <-ctx.Done():
+					// Make sure the lastTS is not empty
+					re.NotEmpty(lastTS)
+					return
+				default:
+				}
+				physical, logical, err := cli.GetTS(ctx)
+				// omit the error check since there are many kinds of errors
+				if err != nil {
+					continue
+				}
+				ts = tsoutil.ComposeTS(physical, logical)
+				re.Less(lastTS, ts)
+				lastTS = ts
+			}
+		}(client)
 	}
-	return errors.WithStack(err)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		parallelAct()
+		cancel()
+	}()
+
+	wg.Wait()
+}
+
+// WaitForMultiKeyspacesTSOAvailable waits for the given keyspaces being served by the tso server side
+func WaitForMultiKeyspacesTSOAvailable(
+	ctx context.Context, re *require.Assertions,
+	keyspaceIDs []uint32, backendEndpoints []string,
+) []pd.Client {
+	wg := sync.WaitGroup{}
+	wg.Add(len(keyspaceIDs))
+
+	clients := make([]pd.Client, 0, len(keyspaceIDs))
+	for _, keyspaceID := range keyspaceIDs {
+		cli := SetupClientWithKeyspaceID(ctx, re, keyspaceID, backendEndpoints)
+		re.NotNil(cli)
+		clients = append(clients, cli)
+
+		go func() {
+			defer wg.Done()
+			testutil.Eventually(re, func() bool {
+				_, _, err := cli.GetTS(ctx)
+				return err == nil
+			})
+		}()
+	}
+
+	wg.Wait()
+	return clients
 }

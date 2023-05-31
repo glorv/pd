@@ -17,7 +17,6 @@ package config
 import (
 	"context"
 	"fmt"
-	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -51,6 +50,7 @@ type PersistOptions struct {
 	pdServerConfig  atomic.Value
 	replicationMode atomic.Value
 	labelProperty   atomic.Value
+	keyspace        atomic.Value
 	clusterVersion  unsafe.Pointer
 }
 
@@ -62,6 +62,7 @@ func NewPersistOptions(cfg *Config) *PersistOptions {
 	o.pdServerConfig.Store(&cfg.PDServerCfg)
 	o.replicationMode.Store(&cfg.ReplicationMode)
 	o.labelProperty.Store(cfg.LabelProperty)
+	o.keyspace.Store(&cfg.Keyspace)
 	o.SetClusterVersion(&cfg.ClusterVersion)
 	o.ttl = nil
 	return o
@@ -115,6 +116,16 @@ func (o *PersistOptions) GetLabelPropertyConfig() LabelPropertyConfig {
 // SetLabelPropertyConfig sets the label property configuration.
 func (o *PersistOptions) SetLabelPropertyConfig(cfg LabelPropertyConfig) {
 	o.labelProperty.Store(cfg)
+}
+
+// GetKeyspaceConfig returns the keyspace config.
+func (o *PersistOptions) GetKeyspaceConfig() *KeyspaceConfig {
+	return o.keyspace.Load().(*KeyspaceConfig)
+}
+
+// SetKeyspaceConfig sets the keyspace configuration.
+func (o *PersistOptions) SetKeyspaceConfig(cfg *KeyspaceConfig) {
+	o.keyspace.Store(cfg)
 }
 
 // GetClusterVersion returns the cluster version.
@@ -173,13 +184,6 @@ func (o *PersistOptions) SetPlacementRulesCacheEnabled(enabled bool) {
 	o.SetReplicationConfig(v)
 }
 
-// SetWitnessEnabled set EanbleWitness
-func (o *PersistOptions) SetWitnessEnabled(enabled bool) {
-	v := o.GetScheduleConfig().Clone()
-	v.EnableWitness = enabled
-	o.SetScheduleConfig(v)
-}
-
 // GetStrictlyMatchLabel returns whether check label strict.
 func (o *PersistOptions) GetStrictlyMatchLabel() bool {
 	return o.GetReplicationConfig().StrictlyMatchLabel
@@ -200,11 +204,9 @@ func (o *PersistOptions) SetMaxReplicas(replicas int) {
 // UseRaftV2 set some config for raft store v2 by default temporary.
 // todo: remove this after raft store support this.
 // disable merge check
-// disable split buckets
 func (o *PersistOptions) UseRaftV2() {
 	v := o.GetScheduleConfig().Clone()
 	v.MaxMergeRegionSize = 0
-	v.MaxMovableHotPeerSize = math.MaxInt64
 	o.SetScheduleConfig(v)
 }
 
@@ -736,6 +738,7 @@ func (o *PersistOptions) Persist(storage endpoint.ConfigStorage) error {
 		PDServerCfg:     *o.GetPDServerConfig(),
 		ReplicationMode: *o.GetReplicationModeConfig(),
 		LabelProperty:   o.GetLabelPropertyConfig(),
+		Keyspace:        *o.GetKeyspaceConfig(),
 		ClusterVersion:  *o.GetClusterVersion(),
 	}
 	err := storage.SaveConfig(cfg)
@@ -763,6 +766,7 @@ func (o *PersistOptions) Reload(storage endpoint.ConfigStorage) error {
 		o.pdServerConfig.Store(&cfg.PDServerCfg)
 		o.replicationMode.Store(&cfg.ReplicationMode)
 		o.labelProperty.Store(cfg.LabelProperty)
+		o.keyspace.Store(&cfg.Keyspace)
 		o.SetClusterVersion(&cfg.ClusterVersion)
 	}
 	return nil
@@ -914,4 +918,16 @@ func (o *PersistOptions) SetAllStoresLimitTTL(ctx context.Context, client *clien
 		err = o.SetTTLData(ctx, client, "default-remove-peer", fmt.Sprint(ratePerMin), ttl)
 	}
 	return err
+}
+
+// SetHaltScheduling set HaltScheduling.
+func (o *PersistOptions) SetHaltScheduling(halt bool) {
+	v := o.GetScheduleConfig().Clone()
+	v.HaltScheduling = halt
+	o.SetScheduleConfig(v)
+}
+
+// IsSchedulingHalted returns if PD scheduling is halted.
+func (o *PersistOptions) IsSchedulingHalted() bool {
+	return o.GetScheduleConfig().HaltScheduling
 }

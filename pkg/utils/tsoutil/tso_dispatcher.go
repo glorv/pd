@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tikv/pd/pkg/errs"
+	"github.com/tikv/pd/pkg/utils/etcdutil"
 	"github.com/tikv/pd/pkg/utils/logutil"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -64,12 +65,12 @@ func (s *TSODispatcher) DispatchRequest(
 	tsoProtoFactory ProtoFactory,
 	doneCh <-chan struct{},
 	errCh chan<- error,
-	updateServicePrimaryAddrChs ...chan<- struct{}) {
+	tsoPrimaryWatchers ...*etcdutil.LoopWatcher) {
 	val, loaded := s.dispatchChs.LoadOrStore(req.getForwardedHost(), make(chan Request, maxMergeRequests))
 	reqCh := val.(chan Request)
 	if !loaded {
 		tsDeadlineCh := make(chan deadline, 1)
-		go s.dispatch(ctx, tsoProtoFactory, req.getForwardedHost(), req.getClientConn(), reqCh, tsDeadlineCh, doneCh, errCh, updateServicePrimaryAddrChs...)
+		go s.dispatch(ctx, tsoProtoFactory, req.getForwardedHost(), req.getClientConn(), reqCh, tsDeadlineCh, doneCh, errCh, tsoPrimaryWatchers...)
 		go watchTSDeadline(ctx, tsDeadlineCh)
 	}
 	reqCh <- req
@@ -84,13 +85,12 @@ func (s *TSODispatcher) dispatch(
 	tsDeadlineCh chan<- deadline,
 	doneCh <-chan struct{},
 	errCh chan<- error,
-	updateServicePrimaryAddrChs ...chan<- struct{}) {
+	tsoPrimaryWatchers ...*etcdutil.LoopWatcher) {
 	defer logutil.LogPanic()
 	dispatcherCtx, ctxCancel := context.WithCancel(ctx)
 	defer ctxCancel()
 	defer s.dispatchChs.Delete(forwardedHost)
 
-	log.Info("create tso forward stream", zap.String("forwarded-host", forwardedHost))
 	forwardStream, cancel, err := tsoProtoFactory.createForwardStream(ctx, clientConn)
 	if err != nil || forwardStream == nil {
 		log.Error("create tso forwarding stream error",
@@ -111,7 +111,7 @@ func (s *TSODispatcher) dispatch(
 	defer cancel()
 
 	requests := make([]Request, maxMergeRequests+1)
-	needUpdateServicePrimaryAddr := len(updateServicePrimaryAddrChs) > 0 && updateServicePrimaryAddrChs[0] != nil
+	needUpdateServicePrimaryAddr := len(tsoPrimaryWatchers) > 0 && tsoPrimaryWatchers[0] != nil
 	for {
 		select {
 		case first := <-tsoRequestCh:
@@ -137,13 +137,8 @@ func (s *TSODispatcher) dispatch(
 				log.Error("proxy forward tso error",
 					zap.String("forwarded-host", forwardedHost),
 					errs.ZapError(errs.ErrGRPCSend, err))
-				if needUpdateServicePrimaryAddr {
-					if strings.Contains(err.Error(), errs.NotLeaderErr) || strings.Contains(err.Error(), errs.MismatchLeaderErr) {
-						select {
-						case updateServicePrimaryAddrChs[0] <- struct{}{}:
-						default:
-						}
-					}
+				if needUpdateServicePrimaryAddr && strings.Contains(err.Error(), errs.NotLeaderErr) {
+					tsoPrimaryWatchers[0].ForceLoad()
 				}
 				select {
 				case <-dispatcherCtx.Done():

@@ -16,6 +16,8 @@ package mcs
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -50,6 +52,56 @@ func NewTestTSOCluster(ctx context.Context, initialServerCount int, backendEndpo
 		}
 	}
 	return tc, nil
+}
+
+// RestartTestTSOCluster restarts the TSO test cluster.
+func RestartTestTSOCluster(
+	ctx context.Context, cluster *TestTSOCluster,
+) (newCluster *TestTSOCluster, err error) {
+	newCluster = &TestTSOCluster{
+		ctx:              ctx,
+		backendEndpoints: cluster.backendEndpoints,
+		servers:          make(map[string]*tso.Server, len(cluster.servers)),
+		cleanupFuncs:     make(map[string]testutil.CleanupFunc, len(cluster.servers)),
+	}
+	var (
+		serverMap  sync.Map
+		cleanupMap sync.Map
+		errorMap   sync.Map
+	)
+	wg := sync.WaitGroup{}
+	for addr, cleanup := range cluster.cleanupFuncs {
+		wg.Add(1)
+		go func(addr string, clean testutil.CleanupFunc) {
+			defer wg.Done()
+			clean()
+			serverCfg := cluster.servers[addr].GetConfig()
+			newServer, newCleanup, err := NewTSOTestServer(newCluster.ctx, serverCfg)
+			serverMap.Store(addr, newServer)
+			cleanupMap.Store(addr, newCleanup)
+			errorMap.Store(addr, err)
+		}(addr, cleanup)
+	}
+	wg.Wait()
+
+	errorMap.Range(func(key, value interface{}) bool {
+		if value != nil {
+			err = value.(error)
+			return false
+		}
+		addr := key.(string)
+		newServer, _ := serverMap.Load(addr)
+		newCleanup, _ := cleanupMap.Load(addr)
+		newCluster.servers[addr] = newServer.(*tso.Server)
+		newCluster.cleanupFuncs[addr] = newCleanup.(testutil.CleanupFunc)
+		return true
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to restart the cluster." + err.Error())
+	}
+
+	return newCluster, nil
 }
 
 // AddServer adds a new TSO server to the test cluster.
@@ -92,12 +144,16 @@ func (tc *TestTSOCluster) DestroyServer(addr string) {
 }
 
 // ResignPrimary resigns the primary TSO server.
-func (tc *TestTSOCluster) ResignPrimary() {
-	tc.GetPrimary(mcsutils.DefaultKeyspaceID, mcsutils.DefaultKeyspaceGroupID).ResignPrimary()
+func (tc *TestTSOCluster) ResignPrimary(keyspaceID, keyspaceGroupID uint32) error {
+	primaryServer := tc.GetPrimaryServer(keyspaceID, keyspaceGroupID)
+	if primaryServer == nil {
+		return fmt.Errorf("no tso server serves this keyspace %d", keyspaceID)
+	}
+	return primaryServer.ResignPrimary(keyspaceID, keyspaceGroupID)
 }
 
-// GetPrimary returns the primary TSO server.
-func (tc *TestTSOCluster) GetPrimary(keyspaceID, keyspaceGroupID uint32) *tso.Server {
+// GetPrimaryServer returns the primary TSO server of the given keyspace
+func (tc *TestTSOCluster) GetPrimaryServer(keyspaceID, keyspaceGroupID uint32) *tso.Server {
 	for _, server := range tc.servers {
 		if server.IsKeyspaceServing(keyspaceID, keyspaceGroupID) {
 			return server
