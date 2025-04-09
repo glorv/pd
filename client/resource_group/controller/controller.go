@@ -83,11 +83,11 @@ type ResourceGroupKVInterceptor interface {
 
 // ResourceGroupProvider provides some api to interact with resource manager server.
 type ResourceGroupProvider interface {
-	GetResourceGroup(ctx context.Context, resourceGroupName string, opts ...pd.GetResourceGroupOption) (*rmpb.ResourceGroup, error)
+	GetResourceGroup(ctx context.Context, keyspaceID uint32, resourceGroupName string, opts ...pd.GetResourceGroupOption) (*rmpb.ResourceGroup, error)
 	ListResourceGroups(ctx context.Context, opts ...pd.GetResourceGroupOption) ([]*rmpb.ResourceGroup, error)
 	AddResourceGroup(ctx context.Context, metaGroup *rmpb.ResourceGroup) (string, error)
 	ModifyResourceGroup(ctx context.Context, metaGroup *rmpb.ResourceGroup) (string, error)
-	DeleteResourceGroup(ctx context.Context, resourceGroupName string) (string, error)
+	DeleteResourceGroup(ctx context.Context, keyspaceID uint32, resourceGroupName string) (string, error)
 	AcquireTokenBuckets(ctx context.Context, request *rmpb.TokenBucketsRequest) ([]*rmpb.TokenBucketResponse, error)
 	LoadResourceGroups(ctx context.Context) ([]*rmpb.ResourceGroup, int64, error)
 
@@ -136,6 +136,7 @@ var _ ResourceGroupKVInterceptor = (*ResourceGroupsController)(nil)
 
 // ResourceGroupsController implements ResourceGroupKVInterceptor.
 type ResourceGroupsController struct {
+	keyspaceID       uint32
 	clientUniqueID   uint64
 	provider         ResourceGroupProvider
 	groupsController sync.Map
@@ -171,6 +172,7 @@ type ResourceGroupsController struct {
 // NewResourceGroupController returns a new ResourceGroupsController which impls ResourceGroupKVInterceptor
 func NewResourceGroupController(
 	ctx context.Context,
+	keyspaceID uint32,
 	clientUniqueID uint64,
 	provider ResourceGroupProvider,
 	requestUnitConfig *RequestUnitConfig,
@@ -186,6 +188,7 @@ func NewResourceGroupController(
 
 	ruConfig := GenerateRUConfig(config)
 	controller := &ResourceGroupsController{
+		keyspaceID:            keyspaceID,
 		clientUniqueID:        clientUniqueID,
 		provider:              provider,
 		ruConfig:              ruConfig,
@@ -360,6 +363,9 @@ func (c *ResourceGroupsController) Start(ctx context.Context) {
 						if err = proto.Unmarshal(item.Kv.Value, group); err != nil {
 							continue
 						}
+						if group.KeyspaceId != c.keyspaceID {
+							continue
+						}
 						name := group.GetName()
 						gc, ok := c.loadGroupController(name)
 						if !ok {
@@ -389,6 +395,9 @@ func (c *ResourceGroupsController) Start(ctx context.Context) {
 							continue
 						}
 						if err = proto.Unmarshal(item.PrevKv.Value, group); err != nil {
+							continue
+						}
+						if group.KeyspaceId != c.keyspaceID {
 							continue
 						}
 						c.tombstoneGroupCostController(group.GetName())
@@ -475,7 +484,7 @@ func (c *ResourceGroupsController) tryGetResourceGroupController(
 		return gc, nil
 	}
 	// Call gRPC to fetch the resource group info.
-	group, err := c.provider.GetResourceGroup(ctx, name)
+	group, err := c.provider.GetResourceGroup(ctx, c.keyspaceID, name)
 	if err != nil {
 		return nil, err
 	}
@@ -1246,6 +1255,7 @@ func initCounterNotify(counter *tokenCounter) {
 func (gc *groupCostController) collectRequestAndConsumption(selectTyp selectType) *rmpb.TokenBucketRequest {
 	req := &rmpb.TokenBucketRequest{
 		ResourceGroupName: gc.name,
+		KeyspaceId:        gc.meta.KeyspaceId,
 	}
 	// collect request resource
 	selected := gc.run.requestInProgress

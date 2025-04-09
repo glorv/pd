@@ -110,6 +110,7 @@ const (
 	resourceGroupSettingsPathFormat = "resource_group/settings/%s" // "resource_group/settings/{group_name}"
 	resourceGroupStatesPathFormat   = "resource_group/states/%s"   // "resource_group/states/{group_name}"
 	controllerConfigPath            = "resource_group/controller"  // "resource_group/controller"
+	keyspaceSettingsPathFormat      = "resource_manager/keyspace/%d" // "resource_manager/keyspace/{keyspace_id}"
 
 	timestampPathFormat   = "/pd/%d/timestamp"              // "/pd/{cluster_id}/timestamp"
 	msTimestampPathFormat = "/ms/%d/tso/%05d/gta/timestamp" // "/ms/{cluster_id}/tso/{group_id}/gta/timestamp"

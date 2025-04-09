@@ -17,6 +17,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
@@ -33,8 +34,9 @@ import (
 // ResourceGroup is the definition of a resource group, for REST API.
 type ResourceGroup struct {
 	syncutil.RWMutex
-	Name string         `json:"name"`
-	Mode rmpb.GroupMode `json:"mode"`
+	KeyspaceID uint32         `json:keyspace_id`
+	Name       string         `json:"name"`
+	Mode       rmpb.GroupMode `json:"mode"`
 	// RU settings
 	RUSettings *RequestUnitSettings     `json:"r_u_settings,omitempty"`
 	Priority   uint32                   `json:"priority"`
@@ -84,6 +86,7 @@ func (rg *ResourceGroup) Clone(withStats bool) *ResourceGroup {
 	rg.RLock()
 	defer rg.RUnlock()
 	newRG := &ResourceGroup{
+		KeyspaceID: rg.KeyspaceID,
 		Name:       rg.Name,
 		Mode:       rg.Mode,
 		Priority:   rg.Priority,
@@ -161,6 +164,7 @@ func (rg *ResourceGroup) PatchSettings(metaGroup *rmpb.ResourceGroup) error {
 // FromProtoResourceGroup converts a rmpb.ResourceGroup to a ResourceGroup.
 func FromProtoResourceGroup(group *rmpb.ResourceGroup) *ResourceGroup {
 	rg := &ResourceGroup{
+		KeyspaceID:    group.KeyspaceId,
 		Name:          group.Name,
 		Mode:          group.Mode,
 		Priority:      group.Priority,
@@ -200,6 +204,13 @@ func (rg *ResourceGroup) RequestRU(
 	return &rmpb.GrantedRUTokenBucket{GrantedTokens: tb, TrickleTimeMs: trickleTimeMs}
 }
 
+func (rg *ResourceGroup) SetOverrideFillRate(fillRate float64) {
+	rg.Lock()
+	defer rg.Unlock()
+
+	rg.RUSettings.RU.dynFillRate = fillRate
+}
+
 // IntoProtoResourceGroup converts a ResourceGroup to a rmpb.ResourceGroup.
 func (rg *ResourceGroup) IntoProtoResourceGroup() *rmpb.ResourceGroup {
 	rg.RLock()
@@ -208,9 +219,10 @@ func (rg *ResourceGroup) IntoProtoResourceGroup() *rmpb.ResourceGroup {
 	switch rg.Mode {
 	case rmpb.GroupMode_RUMode: // RU mode
 		group := &rmpb.ResourceGroup{
-			Name:     rg.Name,
-			Mode:     rmpb.GroupMode_RUMode,
-			Priority: rg.Priority,
+			KeyspaceId: rg.KeyspaceID,
+			Name:       rg.Name,
+			Mode:       rmpb.GroupMode_RUMode,
+			Priority:   rg.Priority,
 			RUSettings: &rmpb.GroupRequestUnitSettings{
 				RU: rg.RUSettings.RU.GetTokenBucket(),
 			},
@@ -233,7 +245,7 @@ func (rg *ResourceGroup) IntoProtoResourceGroup() *rmpb.ResourceGroup {
 // TODO: persist the state of the group separately.
 func (rg *ResourceGroup) persistSettings(storage endpoint.ResourceGroupStorage) error {
 	metaGroup := rg.IntoProtoResourceGroup()
-	return storage.SaveResourceGroupSetting(rg.Name, metaGroup)
+	return storage.SaveResourceGroupSetting(rg.KeyspaceID, rg.Name, metaGroup)
 }
 
 // GroupStates is the tokens set of a resource group.
@@ -301,5 +313,9 @@ func (rg *ResourceGroup) UpdateRUConsumption(c *rmpb.Consumption) {
 // persistStates persists the resource group tokens.
 func (rg *ResourceGroup) persistStates(storage endpoint.ResourceGroupStorage) error {
 	states := rg.GetGroupStates()
-	return storage.SaveResourceGroupStates(rg.Name, states)
+	return storage.SaveResourceGroupStates(rg.KeyspaceID, rg.Name, states)
+}
+
+func GroupLabelName(kID uint32, name string) string {
+	return fmt.Sprintf("%d/%s", kID, name)
 }

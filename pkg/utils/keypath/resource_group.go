@@ -14,29 +14,61 @@
 
 package keypath
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // ControllerConfigPath returns the path to save the controller config.
 func ControllerConfigPath() string {
 	return controllerConfigPath
 }
 
+func keyspaceResourceGroupName(keyspaceID uint32, groupName string) string {
+	kGroupName := groupName
+	// keep it compatible with old format by directly reusing the group name if its the default keyspace
+	if keyspaceID != 0 {
+		kGroupName = fmt.Sprintf("%d/%s", keyspaceID, groupName)
+	}
+	return kGroupName
+}
+
+func ParseKeyspaceGroupName(key string) (uint32, string) {
+	segments := strings.Split(key, "/")
+	if len(segments) == 1 {
+		return 0, key
+	}
+	id, _ := strconv.Atoi(segments[0])
+	return uint32(id), segments[1]
+}
+
 // ResourceGroupSettingPath returns the path to save the resource group settings.
-func ResourceGroupSettingPath(groupName string) string {
-	return fmt.Sprintf(resourceGroupSettingsPathFormat, groupName)
+func ResourceGroupSettingPath(keyspaceID uint32, groupName string) string {
+	kGroupName := keyspaceResourceGroupName(keyspaceID, groupName)
+	return fmt.Sprintf(resourceGroupSettingsPathFormat, kGroupName)
 }
 
 // ResourceGroupStatePath returns the path to save the resource group states.
-func ResourceGroupStatePath(groupName string) string {
-	return fmt.Sprintf(resourceGroupStatesPathFormat, groupName)
+func ResourceGroupStatePath(keyspaceID uint32, groupName string) string {
+	kGroupName := keyspaceResourceGroupName(keyspaceID, groupName)
+	return fmt.Sprintf(resourceGroupStatesPathFormat, kGroupName)
 }
 
 // ResourceGroupSettingPrefix returns the prefix of the resource group settings.
 func ResourceGroupSettingPrefix() string {
-	return ResourceGroupSettingPath("")
+	return ResourceGroupSettingPath(0, "")
 }
 
 // ResourceGroupStatePrefix returns the prefix of the resource group states.
 func ResourceGroupStatePrefix() string {
-	return ResourceGroupStatePath("")
+	return ResourceGroupStatePath(0, "")
+}
+
+func KeyspaceSettingPath(keyspaceID uint32) string {
+	return fmt.Sprintf(keyspaceSettingsPathFormat, keyspaceID)
+}
+
+func KeyspaceSettingPrefix() string {
+	return KeyspaceSettingPath(0)
 }

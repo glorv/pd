@@ -122,6 +122,8 @@ type GroupTokenBucketState struct {
 	clientConsumptionTokensSum float64
 	lastBurstTokens            float64
 
+	dynFillRate                   float64
+
 	LastUpdate  *time.Time `json:"last_update,omitempty"`
 	Initialized bool       `json:"initialized"`
 	// settingChanged is used to avoid that the number of tokens returned is jitter because of changing fill rate.
@@ -151,6 +153,7 @@ func (gts *GroupTokenBucketState) Clone() *GroupTokenBucketState {
 		tokenSlots:                 tokenSlots,
 		clientConsumptionTokensSum: gts.clientConsumptionTokensSum,
 		lastCheckExpireSlot:        gts.lastCheckExpireSlot,
+		dynFillRate:                gts.dynFillRate,
 	}
 }
 
@@ -174,7 +177,11 @@ func (gts *GroupTokenBucketState) resetLoan() {
 func (gts *GroupTokenBucketState) balanceSlotTokens(
 	clientUniqueID uint64,
 	settings *rmpb.TokenLimitSettings,
+	overrideFillRate float64,
 	requiredToken, elapseTokens float64) {
+	if overrideFillRate <= 0.0 {
+		overrideFillRate = float64(settings.GetFillRate())
+	}
 	now := time.Now()
 	slot, exist := gts.tokenSlots[clientUniqueID]
 	if !exist {
@@ -214,7 +221,7 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 	if mode := getBurstableMode(settings); mode == rateControlled || mode == unlimited {
 		for _, slot := range gts.tokenSlots {
 			slot.settings = &rmpb.TokenLimitSettings{
-				FillRate:   uint64(float64(settings.GetFillRate()) * evenRatio),
+				FillRate:   uint64(overrideFillRate * evenRatio),
 				BurstLimit: settings.GetBurstLimit(),
 			}
 		}
@@ -229,7 +236,7 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 			slot.requireTokensSum = 0
 			gts.clientConsumptionTokensSum = 0
 
-			fillRate, burstLimit := calcRateAndBurstLimit(settings, evenRatio)
+			fillRate, burstLimit := calcRateAndBurstLimit(settings, overrideFillRate, evenRatio)
 			slot.settings = &rmpb.TokenLimitSettings{
 				FillRate:   uint64(fillRate),
 				BurstLimit: int64(burstLimit),
@@ -246,7 +253,7 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 			ratio := (1 - slot.requireTokensSum/gts.clientConsumptionTokensSum + evenRatio) * evenRatio
 
 			assignToken := elapseTokens * ratio
-			fillRate, burstLimit := calcRateAndBurstLimit(settings, ratio)
+			fillRate, burstLimit := calcRateAndBurstLimit(settings, overrideFillRate, ratio)
 
 			// Need to reserve burst limit to next balance.
 			if burstLimit > 0 && slot.tokenCapacity > burstLimit {
@@ -271,13 +278,13 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 	}
 }
 
-func calcRateAndBurstLimit(settings *rmpb.TokenLimitSettings, ratio float64) (fillRate, burstLimit float64) {
+func calcRateAndBurstLimit(settings *rmpb.TokenLimitSettings, overrideFillRate float64, ratio float64) (fillRate, burstLimit float64) {
 	if getBurstableMode(settings) == moderated {
-		fillRate = math.Min(float64(settings.GetFillRate())+defaultModeratedBurstRate, unlimitedRate) * ratio
+		fillRate = math.Min(overrideFillRate+defaultModeratedBurstRate, unlimitedRate) * ratio
 		burstLimit = fillRate
 		return
 	}
-	fillRate = float64(settings.GetFillRate()) * ratio
+	fillRate = float64(overrideFillRate) * ratio
 	burstLimit = float64(settings.GetBurstLimit()) * ratio
 	return
 }
@@ -292,6 +299,7 @@ func NewGroupTokenBucket(tokenBucket *rmpb.TokenBucket) *GroupTokenBucket {
 		GroupTokenBucketState: GroupTokenBucketState{
 			Tokens:     tokenBucket.GetTokens(),
 			tokenSlots: make(map[uint64]*TokenSlot),
+			dynFillRate: float64(tokenBucket.GetSettings().GetFillRate()),
 		},
 	}
 }
@@ -347,7 +355,7 @@ func (gtb *GroupTokenBucket) updateTokens(now time.Time, burstLimit int64, clien
 		gtb.init(now, clientUniqueID)
 	} else if burst := float64(burstLimit); burst > 0 {
 		if delta := now.Sub(*gtb.LastUpdate); delta > 0 {
-			elapseTokens = float64(gtb.Settings.GetFillRate())*delta.Seconds() + gtb.lastBurstTokens
+			elapseTokens = gtb.dynFillRate*delta.Seconds() + gtb.lastBurstTokens
 			gtb.lastBurstTokens = 0
 			gtb.Tokens += elapseTokens
 		}
@@ -363,7 +371,7 @@ func (gtb *GroupTokenBucket) updateTokens(now time.Time, burstLimit int64, clien
 		gtb.resetLoan()
 	}
 	// Balance each slots.
-	gtb.balanceSlotTokens(clientUniqueID, gtb.Settings, requiredToken, elapseTokens)
+	gtb.balanceSlotTokens(clientUniqueID, gtb.Settings, gtb.dynFillRate, requiredToken, elapseTokens)
 }
 
 // request requests tokens from the corresponding slot.

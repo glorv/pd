@@ -93,7 +93,7 @@ func (s *Service) GetResourceGroup(_ context.Context, req *rmpb.GetResourceGroup
 	if err := s.checkServing(); err != nil {
 		return nil, err
 	}
-	rg := s.manager.GetResourceGroup(req.ResourceGroupName, req.WithRuStats)
+	rg := s.manager.GetResourceGroup(req.KeyspaceId, req.ResourceGroupName, req.WithRuStats)
 	if rg == nil {
 		return nil, errors.New("resource group not found")
 	}
@@ -134,7 +134,7 @@ func (s *Service) DeleteResourceGroup(_ context.Context, req *rmpb.DeleteResourc
 	if err := s.checkServing(); err != nil {
 		return nil, err
 	}
-	err := s.manager.DeleteResourceGroup(req.ResourceGroupName)
+	err := s.manager.DeleteResourceGroup(req.KeyspaceId, req.ResourceGroupName)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +180,7 @@ func (s *Service) AcquireTokenBuckets(stream rmpb.ResourceManager_AcquireTokenBu
 		for _, req := range request.Requests {
 			resourceGroupName := req.GetResourceGroupName()
 			// Get the resource group from manager to acquire token buckets.
-			rg := s.manager.GetMutableResourceGroup(resourceGroupName)
+			rg := s.manager.GetMutableResourceGroup(req.KeyspaceId, resourceGroupName)
 			if rg == nil {
 				log.Warn("resource group not found", zap.String("resource-group", resourceGroupName))
 				continue
@@ -191,12 +191,14 @@ func (s *Service) AcquireTokenBuckets(stream rmpb.ResourceManager_AcquireTokenBu
 			if isBackground && isTiFlash {
 				return errors.New("background and tiflash cannot be true at the same time")
 			}
-			s.manager.consumptionDispatcher <- struct {
-				resourceGroupName string
-				*rmpb.Consumption
-				isBackground bool
-				isTiFlash    bool
-			}{resourceGroupName, req.GetConsumptionSinceLastRequest(), isBackground, isTiFlash}
+			consumption := &RUConsumptionRecord {
+				keyspaceID: req.KeyspaceId,
+				resourceGroupName: resourceGroupName,
+				Consumption: req.ConsumptionSinceLastRequest,
+				isBackground: isBackground,
+				isTiFlash: isTiFlash,
+			}
+			s.manager.AddRUConsumption(consumption)
 			if isBackground {
 				continue
 			}

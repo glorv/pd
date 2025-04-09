@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/gin-contrib/cors"
@@ -93,11 +94,14 @@ func (s *Service) RegisterRouter() {
 	configEndpoint := s.root.Group("/config")
 	configEndpoint.POST("/group", s.postResourceGroup)
 	configEndpoint.PUT("/group", s.putResourceGroup)
-	configEndpoint.GET("/group/:name", s.getResourceGroup)
+	configEndpoint.GET("/group/:keyspace_id/:name", s.getResourceGroup)
 	configEndpoint.GET("/groups", s.getResourceGroupList)
-	configEndpoint.DELETE("/group/:name", s.deleteResourceGroup)
+	configEndpoint.DELETE("/group/:keyspace_id/:name", s.deleteResourceGroup)
 	configEndpoint.GET("/controller", s.getControllerConfig)
 	configEndpoint.POST("/controller", s.setControllerConfig)
+	configEndpoint.POST("/keyspace", s.postKeyspace)
+	configEndpoint.PUT("/keyspace", s.putKeyspace)
+	configEndpoint.GET("/keyspaces", s.getKeyspaceList)
 }
 
 func (s *Service) handler() http.Handler {
@@ -156,12 +160,21 @@ func (s *Service) putResourceGroup(c *gin.Context) {
 //	@Summary	Get resource group by name.
 //	@Success	200		    {string}	json	format	of	rmserver.ResourceGroup
 //	@Failure	404		    {string}	error
+//  @Param      keyspace    path        uint32  true    "keyspace_id"
 //	@Param		name	    path		string	true	"groupName"
 //	@Param		with_stats	query		bool	false	"whether to return statistics data."
-//	@Router		/config/group/{name} [get]
+//	@Router		/config/keyspace/{keyspace_id}/group/{name} [get]
 func (s *Service) getResourceGroup(c *gin.Context) {
 	withStats := strings.EqualFold(c.Query("with_stats"), "true")
-	group := s.manager.GetResourceGroup(c.Param("name"), withStats)
+	ksStr := c.Param("keyspace_id")
+	kID, err := strconv.ParseUint(ksStr, 10, 32)
+	if err != nil {
+		c.String(http.StatusBadRequest, fmt.Sprintf("invalid keyspace_id '%s', err: '%v'", ksStr, err))
+	}
+	if kID < 0 {
+		c.String(http.StatusBadRequest, fmt.Sprintf("invalid keyspace_id '%d'", kID))
+	}
+	group := s.manager.GetResourceGroup(uint32(kID), c.Param("name"), withStats)
 	if group == nil {
 		c.String(http.StatusNotFound, errors.New("resource group not found").Error())
 	}
@@ -189,9 +202,10 @@ func (s *Service) getResourceGroupList(c *gin.Context) {
 //	@Param		name	path		string	true	"Name of the resource group to be deleted"
 //	@Success	200		{string}	string	"Success!"
 //	@Failure	404		{string}	error
-//	@Router		/config/group/{name} [delete]
+//	@Router		/config/keyspace/{keyspace_id}/group/{name} [delete]
 func (s *Service) deleteResourceGroup(c *gin.Context) {
-	if err := s.manager.DeleteResourceGroup(c.Param("name")); err != nil {
+	kID, _ := strconv.ParseUint(c.Param("keyspace_id"), 10, 32)
+	if err := s.manager.DeleteResourceGroup(uint32(kID), c.Param("name")); err != nil {
 		c.String(http.StatusNotFound, err.Error())
 	}
 	c.String(http.StatusOK, "Success!")
@@ -233,6 +247,53 @@ func (s *Service) setControllerConfig(c *gin.Context) {
 			c.String(http.StatusBadRequest, err.Error())
 			return
 		}
+	}
+	c.String(http.StatusOK, "Success!")
+}
+
+// getKeyspaceList
+//
+//	@Tags		ResourceManager
+//	@Summary	get all keyspace with a list.
+//	@Success	200	{string}	json	format	of	[]rmserver.KeyspaceConfig
+//	@Failure	404	{string}	error
+//	@Router		/config/keyspaces [get]
+func (s *Service) getKeyspaceList(c *gin.Context) {
+	keyspaces := s.manager.GetKeyspaceList()
+	c.IndentedJSON(http.StatusOK, keyspaces)
+}
+
+// postKeyspace
+//
+//	@Tags		ResourceManager
+//	@Summary	Add a resource group
+//	@Param		keyspaceInfo	body		object	true	"json params, rmserver.KeyspaceConfig"
+//	@Success	200			{string}	string	"Success"
+//	@Failure	400			{string}	error
+//	@Failure	500			{string}	error
+//	@Router		/config/keyspace [post]
+func (s *Service) postKeyspace(c *gin.Context) {
+	var keyspace rmserver.KeyspaceConfig
+	if err := c.ShouldBindJSON(&keyspace); err != nil {
+		c.String(http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.manager.AddKeyspace(keyspace); err != nil {
+		c.String(http.StatusInternalServerError, err.Error())
+		return
+	}
+	c.String(http.StatusOK, "Success!")
+}
+
+func (s *Service) putKeyspace(c *gin.Context) {
+	var keyspace rmserver.KeyspaceConfig
+	if err := c.ShouldBindJSON(&keyspace); err != nil {
+		c.String(http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.manager.ModifyKeyspace(keyspace); err != nil {
+		c.String(http.StatusInternalServerError, err.Error())
+		return
 	}
 	c.String(http.StatusOK, "Success!")
 }

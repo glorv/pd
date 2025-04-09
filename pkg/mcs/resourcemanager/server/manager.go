@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"math"
-	"sort"
 	"strings"
 	"time"
 
@@ -54,26 +53,35 @@ const (
 	unlimitedBurstLimit      = -1
 )
 
+type KResourceGroup struct {
+	KeyspaceID uint32
+	Name       string
+}
+
 // Manager is the manager of resource group.
 type Manager struct {
 	syncutil.RWMutex
 	srv              bs.Server
 	controllerConfig *ControllerConfig
-	groups           map[string]*ResourceGroup
+	keyspaces        map[uint32]*KeyspaceResourceGroupManager
 	storage          endpoint.ResourceGroupStorage
 	// consumptionChan is used to send the consumption
 	// info to the background metrics flusher.
-	consumptionDispatcher chan struct {
-		resourceGroupName string
-		*rmpb.Consumption
-		isBackground bool
-		isTiFlash    bool
-	}
+	consumptionDispatcher chan *RUConsumptionRecord
 	// record update time of each resource group
 	consumptionRecord map[consumptionRecordKey]time.Time
 }
 
+type RUConsumptionRecord struct {
+	keyspaceID        uint32
+	resourceGroupName string
+	*rmpb.Consumption
+	isBackground bool
+	isTiFlash    bool
+}
+
 type consumptionRecordKey struct {
+	// the format of name is "{keyspace_id}/{resource_group_name}"
 	name   string
 	ruType string
 }
@@ -88,15 +96,9 @@ type ConfigProvider interface {
 // which should implement the `ConfigProvider` interface.
 func NewManager[T ConfigProvider](srv bs.Server) *Manager {
 	m := &Manager{
-		controllerConfig: srv.(T).GetControllerConfig(),
-		groups:           make(map[string]*ResourceGroup),
-		consumptionDispatcher: make(chan struct {
-			resourceGroupName string
-			*rmpb.Consumption
-			isBackground bool
-			isTiFlash    bool
-		}, defaultConsumptionChanSize),
-		consumptionRecord: make(map[consumptionRecordKey]time.Time),
+		controllerConfig:      srv.(T).GetControllerConfig(),
+		consumptionDispatcher: make(chan *RUConsumptionRecord, defaultConsumptionChanSize),
+		consumptionRecord:     make(map[consumptionRecordKey]time.Time),
 	}
 	// The first initialization after the server is started.
 	srv.AddStartCallback(func() {
@@ -133,28 +135,51 @@ func (m *Manager) Init(ctx context.Context) error {
 		return err
 	}
 	// Load resource group meta info from storage.
-	m.Lock()
-	m.groups = make(map[string]*ResourceGroup)
-	m.Unlock()
-	handler := func(k, v string) {
+	m.keyspaces = make(map[uint32]*KeyspaceResourceGroupManager)
+	keyspaceHandle := func(k, v string) {
+		ks := &KeyspaceConfig{}
+		if err := json.Unmarshal([]byte(v), ks); err != nil {
+			log.Error("failed to parse the keyspace", zap.Error(err), zap.String("k", k), zap.String("v", v))
+			panic(err)
+		}
+
+		m.keyspaces[ks.ID] = NewKeyspaceResourceGroupManager(*ks, m.storage)
+	}
+	if err := m.storage.LoadKeyspaceSettings(keyspaceHandle); err != nil {
+		return err
+	}
+
+	handler := func(keyspaceID uint32, k, v string) {
 		group := &rmpb.ResourceGroup{}
 		if err := proto.Unmarshal([]byte(v), group); err != nil {
 			log.Error("failed to parse the resource group", zap.Error(err), zap.String("k", k), zap.String("v", v))
 			panic(err)
 		}
-		m.groups[group.Name] = FromProtoResourceGroup(group)
+
+		ks, ok := m.keyspaces[keyspaceID]
+		if !ok {
+			log.Error("keyspace not found", zap.Uint32("keyspace", keyspaceID), zap.Stringer("group", group))
+			return
+		}
+		ks.groups[k] = FromProtoResourceGroup(group)
 	}
 	if err := m.storage.LoadResourceGroupSettings(handler); err != nil {
 		return err
 	}
 	// Load resource group states from storage.
-	tokenHandler := func(k, v string) {
+	tokenHandler := func(keyspaceID uint32, k, v string) {
 		tokens := &GroupStates{}
 		if err := json.Unmarshal([]byte(v), tokens); err != nil {
 			log.Error("failed to parse the resource group state", zap.Error(err), zap.String("k", k), zap.String("v", v))
 			panic(err)
 		}
-		if group, ok := m.groups[k]; ok {
+		ks, ok := m.keyspaces[keyspaceID]
+		if !ok {
+			log.Error("keyspace not found", zap.Uint32("keyspace", keyspaceID), zap.String("group_name", k))
+			return
+		}
+
+		if group, ok := ks.groups[k]; ok {
 			group.SetStatesIntoResourceGroup(tokens)
 		}
 	}
@@ -162,34 +187,66 @@ func (m *Manager) Init(ctx context.Context) error {
 		return err
 	}
 
-	// Add default group if it's not inited.
-	if _, ok := m.groups[reservedDefaultGroupName]; !ok {
-		defaultGroup := &ResourceGroup{
-			Name: reservedDefaultGroupName,
-			Mode: rmpb.GroupMode_RUMode,
-			RUSettings: &RequestUnitSettings{
-				RU: &GroupTokenBucket{
-					Settings: &rmpb.TokenLimitSettings{
-						FillRate:   unlimitedRate,
-						BurstLimit: unlimitedBurstLimit,
-					},
-				},
-			},
-			Priority: middlePriority,
-		}
-		if err := m.AddResourceGroup(defaultGroup.IntoProtoResourceGroup()); err != nil {
-			log.Warn("init default group failed", zap.Error(err))
-		}
-	}
-
 	// Start the background metrics flusher.
 	go m.backgroundMetricsFlush(ctx)
+	go m.adjustKeyspaceRULimit(ctx)
 	go func() {
 		defer logutil.LogPanic()
 		m.persistLoop(ctx)
 	}()
 	log.Info("resource group manager finishes initialization")
 	return nil
+}
+
+func (m *Manager) GetKeyspaceList() []KeyspaceConfig {
+	m.RLock()
+	defer m.RUnlock()
+	keyspaces := make([]KeyspaceConfig, 0, len(m.keyspaces))
+	for _, keyspace := range m.keyspaces {
+		keyspaces = append(keyspaces, keyspace.KeyspaceConfig)
+	}
+	return keyspaces
+}
+
+func (m *Manager) AddKeyspace(setting KeyspaceConfig) error {
+	m.Lock()
+	defer m.Unlock()
+
+	ks := NewKeyspaceResourceGroupManager(setting, m.storage)
+	defaultGroup := &ResourceGroup{
+		KeyspaceID: ks.ID,
+		Name:       reservedDefaultGroupName,
+		Mode:       rmpb.GroupMode_RUMode,
+		RUSettings: &RequestUnitSettings{
+			RU: &GroupTokenBucket{
+				Settings: &rmpb.TokenLimitSettings{
+					FillRate:   unlimitedRate,
+					BurstLimit: unlimitedBurstLimit,
+				},
+			},
+		},
+		Priority: middlePriority,
+	}
+	if err := ks.AddResourceGroup(defaultGroup.IntoProtoResourceGroup()); err != nil {
+		log.Warn("init default group failed", zap.Error(err))
+	}
+	m.keyspaces[setting.ID] = ks
+	// init default resource group.
+	return m.storage.SaveKeyspaceSetting(setting.ID, &setting)
+}
+
+func (m *Manager) ModifyKeyspace(setting KeyspaceConfig) error {
+	m.Lock()
+	defer m.Unlock()
+
+	ks, ok := m.keyspaces[setting.ID]
+	if !ok {
+		return errors.Errorf("keyspace %d not found", setting.Name)
+	}
+
+	ks.Lock()
+	ks.KeyspaceConfig = setting
+	return m.storage.SaveKeyspaceSetting(setting.ID, &setting)
 }
 
 // UpdateControllerConfigItem updates the controller config item.
@@ -237,92 +294,73 @@ func (m *Manager) GetControllerConfig() *ControllerConfig {
 // NOTE: AddResourceGroup should also be idempotent because tidb depends
 // on this retry mechanism.
 func (m *Manager) AddResourceGroup(grouppb *rmpb.ResourceGroup) error {
-	// Check the name.
-	if len(grouppb.Name) == 0 || len(grouppb.Name) > 32 {
+	m.RLock()
+	mgr, ok := m.keyspaces[grouppb.KeyspaceId]
+	m.RUnlock()
+	// TODO: define a new error type
+	if !ok {
 		return errs.ErrInvalidGroup
 	}
-	// Check the Priority.
-	if grouppb.GetPriority() > 16 {
-		return errs.ErrInvalidGroup
-	}
-	group := FromProtoResourceGroup(grouppb)
-	m.Lock()
-	defer m.Unlock()
-	if err := group.persistSettings(m.storage); err != nil {
-		return err
-	}
-	if err := group.persistStates(m.storage); err != nil {
-		return err
-	}
-	m.groups[group.Name] = group
-	return nil
+
+	return mgr.AddResourceGroup(grouppb)
 }
 
 // ModifyResourceGroup modifies an existing resource group.
 func (m *Manager) ModifyResourceGroup(group *rmpb.ResourceGroup) error {
-	if group == nil || group.Name == "" {
+	m.RLock()
+	mgr, ok := m.keyspaces[group.KeyspaceId]
+	m.RUnlock()
+	// TODO: define a new error type
+	if !ok {
 		return errs.ErrInvalidGroup
 	}
-	m.Lock()
-	curGroup, ok := m.groups[group.Name]
-	m.Unlock()
-	if !ok {
-		return errs.ErrResourceGroupNotExists.FastGenByArgs(group.Name)
-	}
-
-	err := curGroup.PatchSettings(group)
-	if err != nil {
-		return err
-	}
-	return curGroup.persistSettings(m.storage)
+	return mgr.ModifyResourceGroup(group)
 }
 
 // DeleteResourceGroup deletes a resource group.
-func (m *Manager) DeleteResourceGroup(name string) error {
-	if name == reservedDefaultGroupName {
-		return errs.ErrDeleteReservedGroup
+func (m *Manager) DeleteResourceGroup(keyspaceID uint32, name string) error {
+	m.RLock()
+	mgr, ok := m.keyspaces[keyspaceID]
+	m.RUnlock()
+	// TODO: define a new error type
+	if !ok {
+		return errs.ErrInvalidGroup
 	}
-	if err := m.storage.DeleteResourceGroupSetting(name); err != nil {
-		return err
-	}
-	m.Lock()
-	delete(m.groups, name)
-	m.Unlock()
-	return nil
+
+	return mgr.DeleteResourceGroup(name)
 }
 
 // GetResourceGroup returns a copy of a resource group.
-func (m *Manager) GetResourceGroup(name string, withStats bool) *ResourceGroup {
+func (m *Manager) GetResourceGroup(keyspaceID uint32, name string, withStats bool) *ResourceGroup {
 	m.RLock()
-	defer m.RUnlock()
-	if group, ok := m.groups[name]; ok {
-		return group.Clone(withStats)
+	mgr, ok := m.keyspaces[keyspaceID]
+	m.RUnlock()
+	if !ok {
+		return nil
 	}
-	return nil
+	return mgr.GetResourceGroup(name, withStats)
 }
 
 // GetMutableResourceGroup returns a mutable resource group.
-func (m *Manager) GetMutableResourceGroup(name string) *ResourceGroup {
+func (m *Manager) GetMutableResourceGroup(keyspaceID uint32, name string) *ResourceGroup {
 	m.RLock()
-	defer m.RUnlock()
-	if group, ok := m.groups[name]; ok {
-		return group
+	mgr, ok := m.keyspaces[keyspaceID]
+	m.RUnlock()
+	if !ok {
+		return nil
 	}
-	return nil
+	return mgr.GetMutableResourceGroup(name)
 }
 
 // GetResourceGroupList returns copies of resource group list.
 func (m *Manager) GetResourceGroupList(withStats bool) []*ResourceGroup {
+	groups := []*ResourceGroup{}
 	m.RLock()
-	res := make([]*ResourceGroup, 0, len(m.groups))
-	for _, group := range m.groups {
-		res = append(res, group.Clone(withStats))
+	for _, keyspace := range m.keyspaces {
+		groups = append(groups, keyspace.GetResourceGroupList(withStats)...)
 	}
 	m.RUnlock()
-	sort.Slice(res, func(i, j int) bool {
-		return res[i].Name < res[j].Name
-	})
-	return res
+	return groups
 }
 
 func (m *Manager) persistLoop(ctx context.Context) {
@@ -343,20 +381,43 @@ func (m *Manager) persistLoop(ctx context.Context) {
 
 func (m *Manager) persistResourceGroupRunningState() {
 	m.RLock()
-	keys := make([]string, 0, len(m.groups))
-	for k := range m.groups {
-		keys = append(keys, k)
+	keyspaces := make([]*KeyspaceResourceGroupManager, 0, len(m.keyspaces))
+	for _, ks := range m.keyspaces {
+		keyspaces = append(keyspaces, ks)
 	}
 	m.RUnlock()
-	for idx := range keys {
-		m.RLock()
-		group, ok := m.groups[keys[idx]]
-		if ok {
-			if err := group.persistStates(m.storage); err != nil {
-				log.Error("persist resource group state failed", zap.Error(err))
+	for _, ks := range keyspaces {
+		ks.persistStates()
+	}
+}
+
+func (m *Manager) AddRUConsumption(c *RUConsumptionRecord) {
+	m.RLock()
+	ks, ok := m.keyspaces[c.keyspaceID]
+	m.RUnlock()
+	if ok {
+		ks.ReportConsumption(c)
+	}
+
+	m.consumptionDispatcher <- c
+}
+
+func (m *Manager) adjustKeyspaceRULimit(ctx context.Context) {
+	defer logutil.LogPanic()
+
+	ticker := time.NewTicker(10 * time.Second)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.RLock()
+			for _, ks := range m.keyspaces {
+				ks.updateResourceGroupRULimits()
 			}
+			m.RUnlock()
 		}
-		m.RUnlock()
 	}
 }
 
@@ -369,6 +430,7 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 	defer availableRUTicker.Stop()
 	recordMaxTicker := time.NewTicker(tickPerSecond)
 	defer recordMaxTicker.Stop()
+	// TODO: fix maxPerSecTracks
 	maxPerSecTrackers := make(map[string]*maxPerSecCostTracker)
 	for {
 		select {
@@ -388,7 +450,7 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 			}
 
 			var (
-				name                     = consumptionInfo.resourceGroupName
+				name                     = GroupLabelName(consumptionInfo.keyspaceID, consumptionInfo.resourceGroupName)
 				rruMetrics               = readRequestUnitCost.WithLabelValues(name, name, ruLabelType)
 				wruMetrics               = writeRequestUnitCost.WithLabelValues(name, name, ruLabelType)
 				sqlLayerRuMetrics        = sqlLayerRequestUnitCost.WithLabelValues(name, name)
@@ -436,10 +498,15 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 				writeRequestCountMetrics.Add(consumption.KvWriteRpcCount)
 			}
 
-			m.consumptionRecord[consumptionRecordKey{name: name, ruType: ruLabelType}] = time.Now()
+			recordKey := consumptionRecordKey{
+				name:   name,
+				ruType: ruLabelType,
+			}
+
+			m.consumptionRecord[recordKey] = time.Now()
 
 			// TODO: maybe we need to distinguish background ru.
-			if rg := m.GetMutableResourceGroup(name); rg != nil {
+			if rg := m.GetMutableResourceGroup(consumptionInfo.keyspaceID, name); rg != nil {
 				rg.UpdateRUConsumption(consumptionInfo.Consumption)
 			}
 		case <-cleanUpTicker.C:
@@ -463,14 +530,20 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 					resourceGroupConfigGauge.DeletePartialMatch(prometheus.Labels{newResourceGroupNameLabel: r.name})
 				}
 			}
+
 		case <-availableRUTicker.C:
 			m.RLock()
-			groups := make([]*ResourceGroup, 0, len(m.groups))
-			for name, group := range m.groups {
-				if name == reservedDefaultGroupName {
-					continue
+			groups := make([]*ResourceGroup, 0, len(m.keyspaces))
+			for _, ks := range m.keyspaces {
+				ks.RLock()
+				for _, group := range ks.groups {
+					if group.Name == reservedDefaultGroupName {
+						continue
+					}
+					groups = append(groups, group)
 				}
-				groups = append(groups, group)
+				ks.RUnlock()
+
 			}
 			m.RUnlock()
 			// prevent many groups and hold the lock long time.
@@ -479,18 +552,23 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 				if ru < 0 {
 					ru = 0
 				}
-				availableRUCounter.WithLabelValues(group.Name, group.Name).Set(ru)
-				resourceGroupConfigGauge.WithLabelValues(group.Name, priorityLabel).Set(group.getPriority())
-				resourceGroupConfigGauge.WithLabelValues(group.Name, ruPerSecLabel).Set(group.getFillRate())
-				resourceGroupConfigGauge.WithLabelValues(group.Name, ruCapacityLabel).Set(group.getBurstLimit())
+				labelName := GroupLabelName(group.KeyspaceID, group.Name)
+				availableRUCounter.WithLabelValues(labelName, labelName).Set(ru)
+				resourceGroupConfigGauge.WithLabelValues(labelName, priorityLabel).Set(group.getPriority())
+				resourceGroupConfigGauge.WithLabelValues(labelName, ruPerSecLabel).Set(group.getFillRate())
+				resourceGroupConfigGauge.WithLabelValues(labelName, ruCapacityLabel).Set(group.getBurstLimit())
 			}
 		case <-recordMaxTicker.C:
 			// Record the sum of RRU and WRU every second.
 			m.RLock()
-			names := make([]string, 0, len(m.groups))
-			for name := range m.groups {
-				names = append(names, name)
+			names := make([]string, 0, len(m.keyspaces))
+			for _, ks := range m.keyspaces {
+				ks.RLock()
+				for name := range ks.groups {
+					names = append(names, GroupLabelName(ks.ID, name))
+				}
 			}
+
 			m.RUnlock()
 			for _, name := range names {
 				if t, ok := maxPerSecTrackers[name]; !ok {
