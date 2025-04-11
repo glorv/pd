@@ -16,6 +16,8 @@ package endpoint
 
 import (
 	"github.com/gogo/protobuf/proto"
+	"github.com/pingcap/log"
+	"go.uber.org/zap"
 
 	"github.com/tikv/pd/pkg/utils/keypath"
 )
@@ -83,6 +85,7 @@ func (se *StorageEndpoint) LoadControllerConfig() (string, error) {
 }
 
 func (se *StorageEndpoint) LoadKeyspaceSettings(f func(id, v string)) error {
+	log.Info("load keyspace settings", zap.String("prefix", keypath.KeyspaceSettingPrefix()))
 	return se.loadRangeByPrefix(keypath.KeyspaceSettingPrefix(), func(k, v string) {
 		f(k, v)
 	})

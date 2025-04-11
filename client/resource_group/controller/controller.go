@@ -1351,12 +1351,13 @@ func (gc *groupCostController) calcRequest(counter *tokenCounter) float64 {
 	return value
 }
 
-func (gc *groupCostController) acquireTokens(ctx context.Context, delta *rmpb.Consumption, waitDuration *time.Duration, allowDebt bool) (time.Duration, error) {
+func (gc *groupCostController) acquireTokens(ctx context.Context, delta *rmpb.Consumption, waitDuration *time.Duration, allowDebt bool) (float64, time.Duration, error) {
 	gc.metrics.runningKVRequestCounter.Inc()
 	defer gc.metrics.runningKVRequestCounter.Dec()
 	var (
-		err error
-		d   time.Duration
+		err        error
+		d          time.Duration
+		waitTokens float64
 	)
 retryLoop:
 	for range gc.mainCfg.WaitRetryTimes {
@@ -1369,7 +1370,7 @@ retryLoop:
 					res = append(res, counter.limiter.Reserve(ctx, gc.mainCfg.LTBMaxWaitDuration, now, v))
 				}
 			}
-			if d, err = WaitReservations(ctx, now, res); err == nil || errs.ErrClientResourceGroupThrottled.NotEqual(err) {
+			if waitTokens, d, err = WaitReservations(ctx, now, res); err == nil || errs.ErrClientResourceGroupThrottled.NotEqual(err) {
 				break retryLoop
 			}
 		case rmpb.GroupMode_RUMode:
@@ -1388,7 +1389,7 @@ retryLoop:
 					res = append(res, counter.limiter.Reserve(ctx, gc.mainCfg.LTBMaxWaitDuration, now, v))
 				}
 			}
-			if d, err = WaitReservations(ctx, now, res); err == nil || errs.ErrClientResourceGroupThrottled.NotEqual(err) {
+			if waitTokens, d, err = WaitReservations(ctx, now, res); err == nil || errs.ErrClientResourceGroupThrottled.NotEqual(err) {
 				break retryLoop
 			}
 		}
@@ -1396,7 +1397,7 @@ retryLoop:
 		time.Sleep(gc.mainCfg.WaitRetryInterval)
 		*waitDuration += gc.mainCfg.WaitRetryInterval
 	}
-	return d, err
+	return waitTokens, d, err
 }
 
 func (gc *groupCostController) onRequestWaitImpl(
@@ -1411,8 +1412,9 @@ func (gc *groupCostController) onRequestWaitImpl(
 	add(gc.mu.consumption, delta)
 	gc.mu.Unlock()
 
+	var expectedWaitRU float64
 	if !gc.burstable.Load() {
-		d, err := gc.acquireTokens(ctx, delta, &waitDuration, false)
+		waitTokens, d, err := gc.acquireTokens(ctx, delta, &waitDuration, false)
 		if err != nil {
 			if errs.ErrClientResourceGroupThrottled.Equal(err) {
 				gc.metrics.failedRequestCounterWithThrottled.Inc()
@@ -1430,9 +1432,11 @@ func (gc *groupCostController) onRequestWaitImpl(
 		}
 		gc.metrics.successfulRequestDuration.Observe(d.Seconds())
 		waitDuration += d
+		expectedWaitRU = waitTokens
 	}
 
 	gc.mu.Lock()
+	gc.mu.consumption.ExpectedWaitRu += expectedWaitRU
 	// Calculate the penalty of the store
 	penalty = &rmpb.Consumption{}
 	if storeCounter, exist := gc.mu.storeCounter[info.StoreID()]; exist {
@@ -1498,9 +1502,10 @@ func (gc *groupCostController) onResponseWaitImpl(
 		calc.AfterKVRequest(delta, req, resp)
 	}
 	var waitDuration time.Duration
+	var waitRU float64
 	if !gc.burstable.Load() {
 		allowDebt := delta.ReadBytes+delta.WriteBytes < bigRequestThreshold || !gc.isThrottled.Load()
-		d, err := gc.acquireTokens(ctx, delta, &waitDuration, allowDebt)
+		waitRUs, d, err := gc.acquireTokens(ctx, delta, &waitDuration, allowDebt)
 		if err != nil {
 			if errs.ErrClientResourceGroupThrottled.Equal(err) {
 				gc.metrics.failedRequestCounterWithThrottled.Inc()
@@ -1512,11 +1517,13 @@ func (gc *groupCostController) onResponseWaitImpl(
 		}
 		gc.metrics.successfulRequestDuration.Observe(d.Seconds())
 		waitDuration += d
+		waitRU = waitRUs
 	}
 
 	gc.mu.Lock()
 	// Record the consumption of the request
 	add(gc.mu.consumption, delta)
+	gc.mu.consumption.ExpectedWaitRu += waitRU
 	// Record the consumption of the request by store
 	count := &rmpb.Consumption{}
 	*count = *delta

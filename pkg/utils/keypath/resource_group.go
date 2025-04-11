@@ -70,5 +70,5 @@ func KeyspaceSettingPath(keyspaceID uint32) string {
 }
 
 func KeyspaceSettingPrefix() string {
-	return KeyspaceSettingPath(0)
+	return "resource_manager/keyspace/"
 }

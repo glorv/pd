@@ -144,6 +144,7 @@ func (m *Manager) Init(ctx context.Context) error {
 		}
 
 		m.keyspaces[ks.ID] = NewKeyspaceResourceGroupManager(*ks, m.storage)
+		log.Info("load keyspace", zap.String("id", k), zap.String("v", v))
 	}
 	if err := m.storage.LoadKeyspaceSettings(keyspaceHandle); err != nil {
 		return err
@@ -212,6 +213,10 @@ func (m *Manager) AddKeyspace(setting KeyspaceConfig) error {
 	m.Lock()
 	defer m.Unlock()
 
+	if _, ok := m.keyspaces[setting.ID]; ok {
+		return errors.Errorf("keyspace '%d' already exists", setting.ID)
+	}
+
 	ks := NewKeyspaceResourceGroupManager(setting, m.storage)
 	defaultGroup := &ResourceGroup{
 		KeyspaceID: ks.ID,
@@ -241,10 +246,11 @@ func (m *Manager) ModifyKeyspace(setting KeyspaceConfig) error {
 
 	ks, ok := m.keyspaces[setting.ID]
 	if !ok {
-		return errors.Errorf("keyspace %d not found", setting.Name)
+		return errors.Errorf("keyspace %s not found", setting.Name)
 	}
 
 	ks.Lock()
+	defer ks.Unlock()
 	ks.KeyspaceConfig = setting
 	return m.storage.SaveKeyspaceSetting(setting.ID, &setting)
 }
@@ -412,11 +418,16 @@ func (m *Manager) adjustKeyspaceRULimit(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			keyspaces := make([]*KeyspaceResourceGroupManager, 0)
 			m.RLock()
 			for _, ks := range m.keyspaces {
-				ks.updateResourceGroupRULimits()
+				keyspaces = append(keyspaces, ks)
 			}
 			m.RUnlock()
+
+			for _, ks := range keyspaces {
+				ks.updateResourceGroupRULimits()
+			}
 		}
 	}
 }
@@ -532,9 +543,15 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 			}
 
 		case <-availableRUTicker.C:
+			keyspaces := make([]*KeyspaceResourceGroupManager, 0)
 			m.RLock()
-			groups := make([]*ResourceGroup, 0, len(m.keyspaces))
 			for _, ks := range m.keyspaces {
+				keyspaces = append(keyspaces, ks)
+			}
+			m.RUnlock()
+
+			groups := make([]*ResourceGroup, 0, len(m.keyspaces))
+			for _, ks := range keyspaces {
 				ks.RLock()
 				for _, group := range ks.groups {
 					if group.Name == reservedDefaultGroupName {
@@ -545,7 +562,7 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 				ks.RUnlock()
 
 			}
-			m.RUnlock()
+
 			// prevent many groups and hold the lock long time.
 			for _, group := range groups {
 				ru := group.getRUToken()
@@ -567,6 +584,7 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 				for name := range ks.groups {
 					names = append(names, GroupLabelName(ks.ID, name))
 				}
+				ks.RUnlock()
 			}
 
 			m.RUnlock()

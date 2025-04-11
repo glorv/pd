@@ -208,6 +208,8 @@ func (rg *ResourceGroup) SetOverrideFillRate(fillRate float64) {
 	rg.Lock()
 	defer rg.Unlock()
 
+	log.Info("set group override fillrate", zap.String("rg", rg.Name), zap.Float64("fill_rate", fillRate))
+
 	rg.RUSettings.RU.dynFillRate = fillRate
 }
 

@@ -211,5 +211,5 @@ require (
 )
 
 replace (
-	github.com/pingcap/kvproto => github.com/glorv/kvproto v0.0.0-20250402175400-3e62a49cc201
+	github.com/pingcap/kvproto => github.com/glorv/kvproto v0.0.0-20250411174920-6fe3cfd0fa5a
 )

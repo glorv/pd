@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"sort"
 	"time"
 
@@ -10,14 +11,38 @@ import (
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/utils/syncutil"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
-const groupSlowExpiredDuration = 60 * time.Second
+const groupSlowExpiredDuration = 30 * time.Second
 
 type ResourceGroupTokenTracker struct {
-	ruPerSec           float64
+	fillRate float64
+	// 0 for high, 1 for medium, 2 for low.
+	priority           int
 	overrideRUPerSec   float64
 	consumeTokenWindow SlideWindow
+}
+
+func (rt *ResourceGroupTokenTracker) SetGroupConfig(tokenFillRate float64, priority uint32) {
+	rt.fillRate = tokenFillRate
+	rt.priority = groupPriority2TrackerPriority(priority)
+}
+
+func groupPriority2TrackerPriority(priority uint32) int {
+	// mapping resource group priority to 0~2.
+	// low(1~5) -> 2
+	// medium(6~10) -> 1
+	// high (11~16) -> 0
+	var p int
+	if priority >= 11 {
+		p = 0
+	} else if priority >= 6 {
+		p = 1
+	} else {
+		p = 2
+	}
+	return p
 }
 
 type KeyspaceConfig struct {
@@ -89,7 +114,8 @@ func (km *KeyspaceResourceGroupManager) ModifyResourceGroup(group *rmpb.Resource
 		return err
 	}
 	if tracker, ok := km.groupTokens[group.Name]; ok {
-		tracker.ruPerSec = float64(group.GetRUSettings().GetRU().GetSettings().FillRate)
+		tracker.SetGroupConfig(float64(group.GetRUSettings().GetRU().GetSettings().FillRate), group.Priority)
+
 	}
 	km.Unlock()
 	return curGroup.persistSettings(km.storage)
@@ -162,7 +188,8 @@ func (km *KeyspaceResourceGroupManager) ReportConsumption(c *RUConsumptionRecord
 	if !ok {
 		fillRate := group.getFillRate()
 		tracker = &ResourceGroupTokenTracker{
-			ruPerSec: fillRate,
+			fillRate:         fillRate,
+			priority:         groupPriority2TrackerPriority(group.Priority),
 			overrideRUPerSec: fillRate,
 			consumeTokenWindow: SlideWindow{
 				sampleDuration: 10 * time.Second,
@@ -170,7 +197,7 @@ func (km *KeyspaceResourceGroupManager) ReportConsumption(c *RUConsumptionRecord
 		}
 		km.groupTokens[c.resourceGroupName] = tracker
 	}
-	tracker.consumeTokenWindow.Observe(c.RRU + c.WRU)
+	tracker.consumeTokenWindow.Observe(c.RRU + c.WRU + c.ExpectedWaitRu)
 }
 
 // persistStates persists the resource group tokens.
@@ -192,77 +219,112 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 	totalAvgTokens := 0.
 	totalRU := 0.0
 	totalActiveRU := 0.
+	var priorityActiveTokens [3]float64
 	idleGroups := make(map[string]struct{}, 0)
+
+	type trackedGroup struct {
+		tracker           *ResourceGroupTokenTracker
+		group             *ResourceGroup
+		requiredTokenRate float64
+		normedTokens      float64 // requiredTokenRate/fillRate
+	}
+
+	var priorityTrackerGroup [3][]trackedGroup
+
 	now := time.Now()
 	for name, track := range km.groupTokens {
-		if now.Sub(track.consumeTokenWindow.currentSampleStart) >= groupSlowExpiredDuration {
-			totalRU += track.ruPerSec
+		if now.Sub(track.consumeTokenWindow.lastSampleTime) > track.consumeTokenWindow.sampleDuration {
+			totalRU += track.fillRate
 			idleGroups[name] = struct{}{}
 			continue
 		}
-		totalLatestTokens += track.consumeTokenWindow.LatestSamplePerSec()
-		totalAvgTokens += track.consumeTokenWindow.LatestSamplePerSec()
-		totalActiveRU += track.ruPerSec
+
+		requiredTokenRate := min(track.consumeTokenWindow.AvgSamplePerSec(), track.fillRate)
+
+		priorityTrackerGroup[track.priority] = append(priorityTrackerGroup[track.priority], trackedGroup{
+			tracker:           track,
+			group:             km.groups[name],
+			normedTokens:      requiredTokenRate / track.fillRate,
+			requiredTokenRate: requiredTokenRate,
+		})
+
+		priorityActiveTokens[track.priority] += requiredTokenRate
+		totalLatestTokens += requiredTokenRate
+		totalAvgTokens += track.consumeTokenWindow.AvgSamplePerSec()
+		totalActiveRU += track.fillRate
+	}
+	for _, groups := range priorityTrackerGroup {
+		sort.Slice(groups, func(i, j int) bool {
+			return groups[i].normedTokens <= groups[j].normedTokens
+		})
 	}
 
-	idleThreshold := km.RULimit / 2
-	if totalLatestTokens < idleThreshold && totalAvgTokens < idleThreshold {
-		for name := range km.groupTokens {
-			group, ok := km.groups[name]
-			if !ok {
-				continue
-			}
-			fillRate := group.getFillRate()
-			if fillRate > km.RULimit {
-				fillRate = km.RULimit
-			}
-			if t, ok := km.groupTokens[name]; ok && t.overrideRUPerSec != fillRate {
-				t.overrideRUPerSec = fillRate
-				group.SetOverrideFillRate(fillRate)
-			}
-		}
+	priorityThreshold := [3]float64{0.7 * km.RULimit, 0.2 * km.RULimit, 0.1 * km.RULimit}
 
-		return
+	var priorityExpectedActiveTokens [3]float64
+	for i := range len(priorityExpectedActiveTokens) {
+		priorityExpectedActiveTokens[i] = min(priorityActiveTokens[i], priorityThreshold[i])
 	}
 
-	if totalLatestTokens > km.RULimit * 0.8 {
-		for name, track := range km.groupTokens {
-			if now.Sub(track.consumeTokenWindow.currentSampleStart) >= groupSlowExpiredDuration {
-				continue
+	var priorityRealLimit [3]float64
+	for i := range 3 {
+		otherPriorityLimits := 0.0
+		for j := range 3 {
+			if j != i {
+				otherPriorityLimits += priorityExpectedActiveTokens[j]
 			}
-			group, ok := km.groups[name]
-			if !ok {
-				continue
-			}
-			newRate := km.RULimit * track.ruPerSec / totalActiveRU
-			if newRate / track.ruPerSec >= 0.98 && newRate / track.ruPerSec <= 1.02 {
-				newRate = track.ruPerSec
-			}
-			if  newRate != track.overrideRUPerSec {
-				track.overrideRUPerSec = newRate
-				group.SetOverrideFillRate(newRate)
-			}	
 		}
-		return
+		priorityRealLimit[i] = km.RULimit - otherPriorityLimits
 	}
 
-	for name, track := range km.groupTokens {
-		if now.Sub(track.consumeTokenWindow.currentSampleStart) >= groupSlowExpiredDuration {
-			continue
+	changes := make([]*GroupRuRate, 0)
+
+	for priority, groups := range priorityTrackerGroup {
+		priorityCurLimit := priorityRealLimit[priority]
+		totalFillRate := 0.
+		for _, g := range groups {
+			totalFillRate += g.tracker.fillRate
 		}
-		group, ok := km.groups[name]
-		if !ok {
-			continue
+
+		for _, g := range groups {
+			expectedTokens := min(priorityCurLimit*g.tracker.fillRate/totalFillRate, g.tracker.fillRate)
+			if expectedTokens < g.tracker.overrideRUPerSec*0.98 || expectedTokens > g.tracker.overrideRUPerSec*1.02 {
+				g.tracker.overrideRUPerSec = expectedTokens
+				g.group.SetOverrideFillRate(expectedTokens)
+				changes = append(changes, &GroupRuRate{
+					groupName: g.group.Name,
+					fillRate:  g.tracker.fillRate,
+					realRate:  expectedTokens,
+				})
+			}
+
+			totalFillRate -= g.tracker.fillRate
+			priorityCurLimit -= min(expectedTokens, g.requiredTokenRate)
 		}
-		newRate := km.RULimit * track.ruPerSec / totalActiveRU
-		if newRate / track.ruPerSec >= 0.98 && newRate / track.ruPerSec <= 1.02 {
-			newRate = track.ruPerSec
-		}
-		if  newRate > track.overrideRUPerSec {
-			track.overrideRUPerSec = newRate
-			group.SetOverrideFillRate(newRate)
-		}	
 	}
+
+	if len(changes) > 0 {
+		log.Info("adjust keyspace fillrate", zap.Uint32("keyspace", km.ID), zap.Array("groups", GroupRuRateArray(changes)))
+	}
+}
+
+type GroupRuRate struct {
+	groupName string
+	fillRate  float64
+	realRate  float64
+}
+
+func (g *GroupRuRate) String() string {
+	return fmt.Sprintf("[%s] %f/%f", g.groupName, g.realRate, g.fillRate)
+}
+
+type GroupRuRateArray []*GroupRuRate
+
+func (g GroupRuRateArray) MarshalLogArray(e zapcore.ArrayEncoder) error {
+	for _, r := range g {
+		e.AppendString(r.String())
+	}
+	return nil
 }
 
 const SAMPLE_COUNT = 5
@@ -273,6 +335,7 @@ type SlideWindow struct {
 	currentSample      float64
 	currentSampleStart time.Time
 	sampleDuration     time.Duration
+	lastSampleTime     time.Time
 }
 
 func (w *SlideWindow) Observe(v float64) {
@@ -289,6 +352,7 @@ func (w *SlideWindow) Observe(v float64) {
 		w.currentSampleStart = w.currentSampleStart.Add(w.sampleDuration * sampleCount)
 	}
 	w.currentSample += v
+	w.lastSampleTime = now
 }
 
 func (w *SlideWindow) LatestSamplePerSec() float64 {

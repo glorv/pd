@@ -270,6 +270,10 @@ func updateDeltaConsumption(last *rmpb.Consumption, now *rmpb.Consumption) *rmpb
 		delta.KvWriteRpcCount = now.KvWriteRpcCount - last.KvWriteRpcCount
 		last.KvWriteRpcCount = now.KvWriteRpcCount
 	}
+	if now.ExpectedWaitRu >= last.ExpectedWaitRu {
+		delta.ExpectedWaitRu = now.ExpectedWaitRu - last.ExpectedWaitRu
+		last.ExpectedWaitRu = now.ExpectedWaitRu
+	}
 	return delta
 }
 

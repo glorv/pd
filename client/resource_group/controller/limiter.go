@@ -500,9 +500,9 @@ func (limit Limit) tokensFromDuration(d time.Duration) float64 {
 
 // WaitReservations is used to process a series of reservations
 // so that all limiter tokens are returned if one reservation fails
-func WaitReservations(ctx context.Context, now time.Time, reservations []*Reservation) (time.Duration, error) {
+func WaitReservations(ctx context.Context, now time.Time, reservations []*Reservation) (float64, time.Duration, error) {
 	if len(reservations) == 0 {
-		return 0, nil
+		return 0.0, 0, nil
 	}
 	cancel := func() {
 		for _, res := range reservations {
@@ -510,21 +510,23 @@ func WaitReservations(ctx context.Context, now time.Time, reservations []*Reserv
 		}
 	}
 	longestDelayDuration := time.Duration(0)
+	waitTokens := 0.0
 	for _, res := range reservations {
 		if !res.ok {
 			cancel()
 			if res.err != nil {
-				return res.needWaitDuration, res.err
+				return 0.0, res.needWaitDuration, res.err
 			}
-			return res.needWaitDuration, errs.ErrClientResourceGroupThrottled.FastGenByArgs(res.needWaitDuration, res.limit, res.remainingTokens)
+			return 0.0, res.needWaitDuration, errs.ErrClientResourceGroupThrottled.FastGenByArgs(res.needWaitDuration, res.limit, res.remainingTokens)
 		}
 		delay := res.DelayFrom(now)
 		if delay > longestDelayDuration {
 			longestDelayDuration = delay
+			waitTokens = float64(res.limit) * (float64(delay) / float64(time.Second))
 		}
 	}
 	if longestDelayDuration <= 0 {
-		return 0, nil
+		return 0.0, 0, nil
 	}
 	t := time.NewTimer(longestDelayDuration)
 	defer t.Stop()
@@ -532,11 +534,11 @@ func WaitReservations(ctx context.Context, now time.Time, reservations []*Reserv
 	select {
 	case <-t.C:
 		// We can proceed.
-		return longestDelayDuration, nil
+		return waitTokens, longestDelayDuration, nil
 	case <-ctx.Done():
 		// Context was canceled before we could proceed.  Cancel the
 		// reservation, which may permit other events to proceed sooner.
 		cancel()
-		return 0, ctx.Err()
+		return 0.0, 0, ctx.Err()
 	}
 }
