@@ -192,7 +192,7 @@ func (km *KeyspaceResourceGroupManager) ReportConsumption(c *RUConsumptionRecord
 			priority:         groupPriority2TrackerPriority(group.Priority),
 			overrideRUPerSec: fillRate,
 			consumeTokenWindow: SlideWindow{
-				sampleDuration: 10 * time.Second,
+				sampleDuration: 5 * time.Second,
 			},
 		}
 		km.groupTokens[c.resourceGroupName] = tracker
@@ -267,18 +267,18 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 	}
 
 	var priorityRealLimit [3]float64
+	curTotalLimit := km.RULimit
 	for i := range 3 {
-		otherPriorityLimits := 0.0
-		for j := range 3 {
-			if j != i {
-				otherPriorityLimits += priorityExpectedActiveTokens[j]
-			}
+		restReserved := 0.0
+		for j := i + 1; j < 3; j++ {
+			restReserved += priorityExpectedActiveTokens[j]
 		}
-		priorityRealLimit[i] = km.RULimit - otherPriorityLimits
+		priorityRealLimit[i] = curTotalLimit - restReserved
+		curTotalLimit -= min(priorityRealLimit[i], priorityActiveTokens[i])
 	}
 
 	changes := make([]*GroupRuRate, 0)
-
+	changed := false
 	for priority, groups := range priorityTrackerGroup {
 		priorityCurLimit := priorityRealLimit[priority]
 		totalFillRate := 0.
@@ -291,20 +291,22 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 			if expectedTokens < g.tracker.overrideRUPerSec*0.98 || expectedTokens > g.tracker.overrideRUPerSec*1.02 {
 				g.tracker.overrideRUPerSec = expectedTokens
 				g.group.SetOverrideFillRate(expectedTokens)
-				changes = append(changes, &GroupRuRate{
-					groupName: g.group.Name,
-					fillRate:  g.tracker.fillRate,
-					realRate:  expectedTokens,
-				})
+				changed = true
 			}
+			changes = append(changes, &GroupRuRate{
+				groupName: g.group.Name,
+				fillRate:  g.tracker.fillRate,
+				realRate:  expectedTokens,
+			})
 
 			totalFillRate -= g.tracker.fillRate
 			priorityCurLimit -= min(expectedTokens, g.requiredTokenRate)
 		}
 	}
 
-	if len(changes) > 0 {
-		log.Info("adjust keyspace fillrate", zap.Uint32("keyspace", km.ID), zap.Array("groups", GroupRuRateArray(changes)))
+	if changed {
+		log.Info("adjust keyspace fillrate", zap.Uint32("keyspace", km.ID), zap.Array("groups", GroupRuRateArray(changes)),
+			zap.Array("level_limit", float64Arr(priorityRealLimit[:])))
 	}
 }
 
@@ -323,6 +325,15 @@ type GroupRuRateArray []*GroupRuRate
 func (g GroupRuRateArray) MarshalLogArray(e zapcore.ArrayEncoder) error {
 	for _, r := range g {
 		e.AppendString(r.String())
+	}
+	return nil
+}
+
+type float64Arr []float64
+
+func (a float64Arr) MarshalLogArray(e zapcore.ArrayEncoder) error {
+	for _, r := range a {
+		e.AppendFloat64(r)
 	}
 	return nil
 }

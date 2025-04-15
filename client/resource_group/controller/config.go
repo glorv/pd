@@ -49,7 +49,7 @@ const (
 	defaultGroupStateUpdateInterval = 1 * time.Second
 	// targetPeriod indicate how long it is expected to cost token when acquiring token.
 	// According to the resource control Grafana panel and Prometheus sampling period, the period should be the factor of 15.
-	defaultTargetPeriod = 5 * time.Second
+	defaultTargetPeriod = 2500 * time.Millisecond
 	// defaultMaxWaitDuration is the max duration to wait for the token before throwing error.
 	defaultMaxWaitDuration = 30 * time.Second
 	// defaultLTBTokenRPCMaxDelay is the upper bound of backoff delay for local token bucket RPC.

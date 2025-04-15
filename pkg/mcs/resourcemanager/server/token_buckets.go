@@ -123,6 +123,7 @@ type GroupTokenBucketState struct {
 	lastBurstTokens            float64
 
 	dynFillRate                   float64
+	burstFactor                   float64
 
 	LastUpdate  *time.Time `json:"last_update,omitempty"`
 	Initialized bool       `json:"initialized"`
@@ -154,6 +155,7 @@ func (gts *GroupTokenBucketState) Clone() *GroupTokenBucketState {
 		clientConsumptionTokensSum: gts.clientConsumptionTokensSum,
 		lastCheckExpireSlot:        gts.lastCheckExpireSlot,
 		dynFillRate:                gts.dynFillRate,
+		burstFactor:                gts.burstFactor,
 	}
 }
 
@@ -300,6 +302,7 @@ func NewGroupTokenBucket(tokenBucket *rmpb.TokenBucket) *GroupTokenBucket {
 			Tokens:     tokenBucket.GetTokens(),
 			tokenSlots: make(map[uint64]*TokenSlot),
 			dynFillRate: float64(tokenBucket.GetSettings().GetFillRate()),
+			burstFactor: float64(tokenBucket.Settings.BurstLimit) / float64(tokenBucket.Settings.FillRate),
 		},
 	}
 }

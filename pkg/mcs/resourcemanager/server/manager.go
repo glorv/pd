@@ -411,7 +411,7 @@ func (m *Manager) AddRUConsumption(c *RUConsumptionRecord) {
 func (m *Manager) adjustKeyspaceRULimit(ctx context.Context) {
 	defer logutil.LogPanic()
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 
 	for {
 		select {
