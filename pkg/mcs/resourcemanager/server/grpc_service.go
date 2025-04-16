@@ -191,12 +191,12 @@ func (s *Service) AcquireTokenBuckets(stream rmpb.ResourceManager_AcquireTokenBu
 			if isBackground && isTiFlash {
 				return errors.New("background and tiflash cannot be true at the same time")
 			}
-			consumption := &RUConsumptionRecord {
-				keyspaceID: req.KeyspaceId,
+			consumption := &RUConsumptionRecord{
+				keyspaceID:        req.KeyspaceId,
 				resourceGroupName: resourceGroupName,
-				Consumption: req.ConsumptionSinceLastRequest,
-				isBackground: isBackground,
-				isTiFlash: isTiFlash,
+				Consumption:       req.ConsumptionSinceLastRequest,
+				isBackground:      isBackground,
+				isTiFlash:         isTiFlash,
 			}
 			s.manager.AddRUConsumption(consumption)
 			if isBackground {
@@ -216,6 +216,7 @@ func (s *Service) AcquireTokenBuckets(stream rmpb.ResourceManager_AcquireTokenBu
 					if tokens == nil {
 						continue
 					}
+					log.Debug("acquire tokens", zap.String("group", resourceGroupName), zap.Any("req", req), zap.Any("tokens", tokens))
 					resp.GrantedRUTokens = append(resp.GrantedRUTokens, tokens)
 				}
 			case rmpb.GroupMode_RawMode:

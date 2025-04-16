@@ -206,14 +206,19 @@ func (rg *ResourceGroup) RequestRU(
 
 func (rg *ResourceGroup) SetOverrideFillRate(fillRate float64) {
 	rg.Lock()
-	defer rg.Unlock()
 
-	log.Info("set group override fillrate", zap.Uint32("ks", rg.KeyspaceID), zap.String("rg", rg.Name), zap.Float64("fill_rate", fillRate))
-
-	rg.RUSettings.RU.dynFillRate = fillRate
+	rg.RUSettings.RU.overrideFillRate = fillRate
+	rg.RUSettings.RU.overrideBurstLimit = fillRate
 	// TODO
-	rg.RUSettings.RU.Settings.BurstLimit = int64(fillRate * rg.RUSettings.RU.burstFactor)
-	rg.RUSettings.RU.resetLoan()
+	// rg.RUSettings.RU.Settings.BurstLimit = int64(fillRate * rg.RUSettings.RU.burstFactor)
+	rg.Unlock()
+	//rg.RUSettings.RU.resetLoan()
+	// if rg.RUSettings.RU.Tokens < float64(rg.RUSettings.RU.Settings.BurstLimit) {
+	// 	rg.RUSettings.RU.Tokens = float64(rg.RUSettings.RU.Settings.BurstLimit)
+	// 	rg.RUSettings.RU.settingChanged = true
+	// }
+
+	log.Info("set group override fillrate", zap.Uint32("ks", rg.KeyspaceID), zap.String("rg", rg.Name), zap.Float64("fill_rate", fillRate), zap.Int64("burst_limit", rg.RUSettings.RU.Settings.BurstLimit))
 }
 
 // IntoProtoResourceGroup converts a ResourceGroup to a rmpb.ResourceGroup.
@@ -290,7 +295,8 @@ func (rg *ResourceGroup) SetStatesIntoResourceGroup(states *GroupStates) {
 	case rmpb.GroupMode_RUMode:
 		if state := states.RU; state != nil {
 			rg.RUSettings.RU.setState(state)
-			log.Debug("update group token bucket state", zap.String("name", rg.Name), zap.Any("state", state))
+			log.Info("update group token bucket state", zap.String("name", rg.Name), zap.Any("state", state),
+				zap.Any("settings", rg.RUSettings))
 		}
 		if states.RUConsumption != nil {
 			rg.UpdateRUConsumption(states.RUConsumption)

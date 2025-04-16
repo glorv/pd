@@ -59,6 +59,7 @@ type KeyspaceResourceGroupManager struct {
 	groups map[string]*ResourceGroup
 	// RU token consumption tracker
 	// group_name --> token_history
+	trackLock   syncutil.Mutex
 	groupTokens map[string]*ResourceGroupTokenTracker
 
 	storage endpoint.ResourceGroupStorage
@@ -172,8 +173,8 @@ func (km *KeyspaceResourceGroupManager) GetResourceGroupList(withStats bool) []*
 }
 
 func (km *KeyspaceResourceGroupManager) ReportConsumption(c *RUConsumptionRecord) {
-	km.Lock()
-	defer km.Unlock()
+	km.RLock()
+	defer km.RUnlock()
 
 	group, ok := km.groups[c.resourceGroupName]
 	if !ok {
@@ -184,6 +185,7 @@ func (km *KeyspaceResourceGroupManager) ReportConsumption(c *RUConsumptionRecord
 		return
 	}
 
+	km.trackLock.Lock()
 	tracker, ok := km.groupTokens[c.resourceGroupName]
 	if !ok {
 		fillRate := group.getFillRate()
@@ -198,6 +200,7 @@ func (km *KeyspaceResourceGroupManager) ReportConsumption(c *RUConsumptionRecord
 		km.groupTokens[c.resourceGroupName] = tracker
 	}
 	tracker.consumeTokenWindow.Observe(c.RRU + c.WRU + c.ExpectedWaitRu)
+	km.trackLock.Unlock()
 }
 
 // persistStates persists the resource group tokens.
@@ -212,15 +215,13 @@ func (km *KeyspaceResourceGroupManager) persistStates() {
 }
 
 func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
-	km.Lock()
-	defer km.Unlock()
+	km.RLock()
+	defer km.RUnlock()
 
 	totalLatestTokens := 0.
 	totalAvgTokens := 0.
-	totalRU := 0.0
 	totalActiveRU := 0.
 	var priorityActiveTokens [3]float64
-	idleGroups := make(map[string]struct{}, 0)
 
 	type trackedGroup struct {
 		tracker           *ResourceGroupTokenTracker
@@ -232,10 +233,26 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 	var priorityTrackerGroup [3][]trackedGroup
 
 	now := time.Now()
+	changed := false
+	changes := make([]*GroupRuRate, 0)
+	km.trackLock.Lock()
 	for name, track := range km.groupTokens {
 		if now.Sub(track.consumeTokenWindow.lastSampleTime) > track.consumeTokenWindow.sampleDuration {
-			totalRU += track.fillRate
-			idleGroups[name] = struct{}{}
+			// newFillRate := min(track.fillRate, km.RULimit)
+			// if track.overrideRUPerSec != newFillRate {
+			// 	track.overrideRUPerSec = newFillRate
+			// 	km.groups[name].SetOverrideFillRate(newFillRate)
+			// 	changed = true
+			// 	changes = append(changes, &GroupRuRate{
+			// 		groupName: name,
+			// 		fillRate:  newFillRate,
+			// 		realRate:  newFillRate,
+			// 	})
+			// }
+			continue
+		}
+		// ignore default currently.
+		if name == "default" {
 			continue
 		}
 
@@ -273,12 +290,10 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 		for j := i + 1; j < 3; j++ {
 			restReserved += priorityExpectedActiveTokens[j]
 		}
-		priorityRealLimit[i] = curTotalLimit - restReserved
+		priorityRealLimit[i] = max(curTotalLimit-restReserved, priorityThreshold[i])
 		curTotalLimit -= min(priorityRealLimit[i], priorityActiveTokens[i])
 	}
 
-	changes := make([]*GroupRuRate, 0)
-	changed := false
 	for priority, groups := range priorityTrackerGroup {
 		priorityCurLimit := priorityRealLimit[priority]
 		totalFillRate := 0.
@@ -288,7 +303,7 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 
 		for _, g := range groups {
 			expectedTokens := min(priorityCurLimit*g.tracker.fillRate/totalFillRate, g.tracker.fillRate)
-			if expectedTokens < g.tracker.overrideRUPerSec*0.98 || expectedTokens > g.tracker.overrideRUPerSec*1.02 {
+			if expectedTokens < g.tracker.overrideRUPerSec*0.95 || expectedTokens > g.tracker.overrideRUPerSec*1.05 {
 				g.tracker.overrideRUPerSec = expectedTokens
 				g.group.SetOverrideFillRate(expectedTokens)
 				changed = true
@@ -296,13 +311,14 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 			changes = append(changes, &GroupRuRate{
 				groupName: g.group.Name,
 				fillRate:  g.tracker.fillRate,
-				realRate:  expectedTokens,
+				realRate:  g.tracker.overrideRUPerSec,
 			})
 
 			totalFillRate -= g.tracker.fillRate
 			priorityCurLimit -= min(expectedTokens, g.requiredTokenRate)
 		}
 	}
+	km.trackLock.Unlock()
 
 	if changed {
 		log.Info("adjust keyspace fillrate", zap.Uint32("keyspace", km.ID), zap.Array("groups", GroupRuRateArray(changes)),
