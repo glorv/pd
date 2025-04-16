@@ -165,6 +165,7 @@ func (s *Service) AcquireTokenBuckets(stream rmpb.ResourceManager_AcquireTokenBu
 		if err == io.EOF {
 			return nil
 		}
+		start := time.Now()
 		failpoint.Inject("acquireFailed", func() {
 			err = errors.New("error")
 		})
@@ -228,6 +229,10 @@ func (s *Service) AcquireTokenBuckets(stream rmpb.ResourceManager_AcquireTokenBu
 		}
 		if err := stream.Send(resps); err != nil {
 			return errors.WithStack(err)
+		}
+		dur := time.Since(start)
+		if dur > time.Second {
+			log.Warn("acquire token buckets too slow", zap.Duration("dur", dur), zap.Any("reqs", request))
 		}
 	}
 }
