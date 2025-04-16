@@ -215,6 +215,8 @@ func (km *KeyspaceResourceGroupManager) persistStates() {
 }
 
 func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
+	start := time.Now()
+
 	km.RLock()
 	defer km.RUnlock()
 
@@ -235,7 +237,6 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 	now := time.Now()
 	changed := false
 	changes := make([]*GroupRuRate, 0)
-	km.trackLock.Lock()
 	for name, track := range km.groupTokens {
 		if now.Sub(track.consumeTokenWindow.lastSampleTime) > track.consumeTokenWindow.sampleDuration {
 			// newFillRate := min(track.fillRate, km.RULimit)
@@ -294,6 +295,12 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 		curTotalLimit -= min(priorityRealLimit[i], priorityActiveTokens[i])
 	}
 
+	type groupFillRate struct {
+		group    *ResourceGroup
+		fillRate float64
+	}
+
+	updateGroups := make([]groupFillRate, 0)
 	for priority, groups := range priorityTrackerGroup {
 		priorityCurLimit := priorityRealLimit[priority]
 		totalFillRate := 0.
@@ -305,7 +312,10 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 			expectedTokens := min(priorityCurLimit*g.tracker.fillRate/totalFillRate, g.tracker.fillRate)
 			if expectedTokens < g.tracker.overrideRUPerSec*0.95 || expectedTokens > g.tracker.overrideRUPerSec*1.05 {
 				g.tracker.overrideRUPerSec = expectedTokens
-				g.group.SetOverrideFillRate(expectedTokens)
+				updateGroups = append(updateGroups, groupFillRate{
+					group:    g.group,
+					fillRate: expectedTokens,
+				})
 				changed = true
 			}
 			changes = append(changes, &GroupRuRate{
@@ -320,9 +330,13 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 	}
 	km.trackLock.Unlock()
 
+	for _, g := range updateGroups {
+		g.group.SetOverrideFillRate(g.fillRate)
+	}
+
 	if changed {
 		log.Info("adjust keyspace fillrate", zap.Uint32("keyspace", km.ID), zap.Array("groups", GroupRuRateArray(changes)),
-			zap.Array("level_limit", float64Arr(priorityRealLimit[:])))
+			zap.Array("level_limit", float64Arr(priorityRealLimit[:])), zap.Duration("dur", time.Since(start)))
 	}
 }
 
