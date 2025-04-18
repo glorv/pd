@@ -208,7 +208,10 @@ func (rg *ResourceGroup) SetOverrideFillRate(fillRate float64) {
 	rg.Lock()
 
 	rg.RUSettings.RU.overrideFillRate = fillRate
-	rg.RUSettings.RU.overrideBurstLimit = fillRate
+	if rg.RUSettings.RU.Settings.BurstLimit > 0 {
+		rg.RUSettings.RU.overrideBurstLimit = fillRate / float64(rg.RUSettings.RU.Settings.FillRate) * float64(rg.RUSettings.RU.Settings.BurstLimit)
+	}
+
 	// TODO
 	// rg.RUSettings.RU.Settings.BurstLimit = int64(fillRate * rg.RUSettings.RU.burstFactor)
 	rg.Unlock()
@@ -218,7 +221,7 @@ func (rg *ResourceGroup) SetOverrideFillRate(fillRate float64) {
 	// 	rg.RUSettings.RU.settingChanged = true
 	// }
 
-	log.Info("set group override fillrate", zap.Uint32("ks", rg.KeyspaceID), zap.String("rg", rg.Name), zap.Float64("fill_rate", fillRate), zap.Int64("burst_limit", rg.RUSettings.RU.Settings.BurstLimit))
+	log.Info("set group override fillrate", zap.Uint32("ks", rg.KeyspaceID), zap.String("rg", rg.Name), zap.Float64("fill_rate", fillRate), zap.Int64("burst_limit", int64(rg.RUSettings.RU.overrideBurstLimit)))
 }
 
 // IntoProtoResourceGroup converts a ResourceGroup to a rmpb.ResourceGroup.

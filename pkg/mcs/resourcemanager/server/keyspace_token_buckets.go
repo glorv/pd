@@ -194,7 +194,7 @@ func (km *KeyspaceResourceGroupManager) ReportConsumption(c *RUConsumptionRecord
 			priority:         groupPriority2TrackerPriority(group.Priority),
 			overrideRUPerSec: fillRate,
 			consumeTokenWindow: SlideWindow{
-				sampleSeconds: 5,
+				sampleSeconds: 10,
 			},
 		}
 		km.groupTokens[c.resourceGroupName] = tracker
@@ -258,7 +258,11 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 			continue
 		}
 
-		requiredTokenRate := min(track.consumeTokenWindow.AvgSamplePerSec(), track.fillRate)
+		requiredTokenRate := min(track.consumeTokenWindow.LatestSamplePerSec(), track.fillRate)
+
+		if requiredTokenRate < 50 {
+			continue
+		}
 
 		priorityTrackerGroup[track.priority] = append(priorityTrackerGroup[track.priority], trackedGroup{
 			tracker:           track,
@@ -380,6 +384,7 @@ type SlideWindow struct {
 	currentSampleStart int64
 	sampleSeconds      int64
 	lastSampleTime     int64
+	validSampleCount   int
 }
 
 func (w *SlideWindow) Observe(v float64) {
@@ -387,11 +392,14 @@ func (w *SlideWindow) Observe(v float64) {
 	// try to fill missing samples with latest sample.
 	dur := now - w.currentSampleStart
 	if dur > w.sampleSeconds {
-		sampleCount := min(dur/w.sampleSeconds, int64(len(w.samples)))
-		for range sampleCount {
+		if now-w.lastSampleTime < w.sampleSeconds {
+			w.lastIndex = (w.lastIndex + 1) % SAMPLE_COUNT
 			w.samples[w.lastIndex] = w.currentSample
+			w.validSampleCount = min(w.validSampleCount+1, len(w.samples))
+		} else {
+			w.validSampleCount = 0
 		}
-		w.lastIndex = (w.lastIndex + 1) % 5
+
 		w.currentSample = 0.
 		w.currentSampleStart = now - now%w.sampleSeconds
 	}
@@ -400,16 +408,31 @@ func (w *SlideWindow) Observe(v float64) {
 }
 
 func (w *SlideWindow) LatestSamplePerSec() float64 {
-	return w.samples[w.lastIndex] / float64(w.sampleSeconds)
+	if time.Now().Unix()-w.lastSampleTime > w.sampleSeconds {
+		return 0.0
+	}
+	total := w.currentSample
+	totalDur := w.lastSampleTime - w.currentSampleStart
+	if totalDur < w.sampleSeconds/2 && w.validSampleCount > 0 {
+		total += w.samples[w.lastIndex]
+		totalDur += w.sampleSeconds
+	}
+	return total / float64(totalDur)
 }
 
 func (w *SlideWindow) AvgSamplePerSec() float64 {
-	sum := 0.
-	for _, s := range w.samples {
-		sum += s
+	if time.Now().Unix()-w.lastSampleTime > w.sampleSeconds {
+		return 0.0
+	}
+	sum := w.currentSample
+	dur := w.lastSampleTime - w.currentSampleStart
+	for i := range w.validSampleCount {
+		idx := (w.lastIndex + SAMPLE_COUNT - i) % SAMPLE_COUNT
+		sum += w.samples[idx]
+		dur += w.sampleSeconds
 	}
 
-	return sum / float64(int(w.sampleSeconds)*len(w.samples))
+	return sum / float64(dur)
 }
 
 func (w *SlideWindow) LatestSampleTime() time.Time {

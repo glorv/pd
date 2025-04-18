@@ -182,6 +182,7 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 	clientUniqueID uint64,
 	settings *rmpb.TokenLimitSettings,
 	overrideFillRate float64,
+	overrideBurstLimit float64,
 	requiredToken, elapseTokens float64) {
 	if overrideFillRate <= 0.0 {
 		overrideFillRate = float64(settings.GetFillRate())
@@ -226,7 +227,7 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 		for _, slot := range gts.tokenSlots {
 			slot.settings = &rmpb.TokenLimitSettings{
 				FillRate:   uint64(overrideFillRate * evenRatio),
-				BurstLimit: int64(settings.BurstLimit),
+				BurstLimit: int64(overrideBurstLimit),
 			}
 		}
 		return
@@ -240,7 +241,7 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 			slot.requireTokensSum = 0
 			gts.clientConsumptionTokensSum = 0
 
-			fillRate, burstLimit := calcRateAndBurstLimit(settings, overrideFillRate, evenRatio)
+			fillRate, burstLimit := calcRateAndBurstLimit(settings, overrideFillRate, overrideBurstLimit, evenRatio)
 			slot.settings = &rmpb.TokenLimitSettings{
 				FillRate:   uint64(fillRate),
 				BurstLimit: int64(burstLimit),
@@ -257,7 +258,7 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 			ratio := (1 - slot.requireTokensSum/gts.clientConsumptionTokensSum + evenRatio) * evenRatio
 
 			assignToken := elapseTokens * ratio
-			fillRate, burstLimit := calcRateAndBurstLimit(settings, overrideFillRate, ratio)
+			fillRate, burstLimit := calcRateAndBurstLimit(settings, overrideFillRate, overrideBurstLimit, ratio)
 
 			// Need to reserve burst limit to next balance.
 			if burstLimit > 0 && slot.tokenCapacity > burstLimit {
@@ -282,14 +283,14 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 	}
 }
 
-func calcRateAndBurstLimit(settings *rmpb.TokenLimitSettings, overrideFillRate float64, ratio float64) (fillRate, burstLimit float64) {
+func calcRateAndBurstLimit(settings *rmpb.TokenLimitSettings, overrideFillRate, overrideBurstLimit, ratio float64) (fillRate, burstLimit float64) {
 	if getBurstableMode(settings) == moderated {
 		fillRate = math.Min(overrideFillRate+defaultModeratedBurstRate, unlimitedRate) * ratio
 		burstLimit = fillRate
 		return
 	}
 	fillRate = float64(overrideFillRate) * ratio
-	burstLimit = float64(settings.GetBurstLimit()) * ratio
+	burstLimit = float64(overrideBurstLimit) * ratio
 	return
 }
 
@@ -379,7 +380,7 @@ func (gtb *GroupTokenBucket) updateTokens(now time.Time, burstLimit float64, cli
 		gtb.resetLoan()
 	}
 	// Balance each slots.
-	gtb.balanceSlotTokens(clientUniqueID, gtb.Settings, gtb.overrideFillRate, requiredToken, elapseTokens)
+	gtb.balanceSlotTokens(clientUniqueID, gtb.Settings, gtb.overrideFillRate, gtb.overrideBurstLimit, requiredToken, elapseTokens)
 }
 
 // request requests tokens from the corresponding slot.
