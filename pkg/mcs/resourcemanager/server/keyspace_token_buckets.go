@@ -14,7 +14,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-const groupSlowExpiredDuration = 30 * time.Second
+const MIN_TOKEN_FILL_RATE float64 = 100
 
 type ResourceGroupTokenTracker struct {
 	fillRate float64
@@ -258,7 +258,7 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 			continue
 		}
 
-		requiredTokenRate := min(track.consumeTokenWindow.LatestSamplePerSec(), track.fillRate)
+		requiredTokenRate := min(track.consumeTokenWindow.AvgSamplePerSec(), track.fillRate)
 
 		if requiredTokenRate < 50 {
 			continue
@@ -282,22 +282,12 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 		})
 	}
 
-	priorityThreshold := [3]float64{0.7 * km.RULimit, 0.2 * km.RULimit, 0.1 * km.RULimit}
-
-	var priorityExpectedActiveTokens [3]float64
-	for i := range len(priorityExpectedActiveTokens) {
-		priorityExpectedActiveTokens[i] = min(priorityActiveTokens[i], priorityThreshold[i])
-	}
-
 	var priorityRealLimit [3]float64
 	curTotalLimit := km.RULimit
 	for i := range 3 {
-		restReserved := 0.0
-		for j := i + 1; j < 3; j++ {
-			restReserved += priorityExpectedActiveTokens[j]
-		}
-		priorityRealLimit[i] = max(curTotalLimit-restReserved, priorityThreshold[i])
-		curTotalLimit -= min(priorityRealLimit[i], priorityActiveTokens[i])
+		priorityRealLimit[i] = min(curTotalLimit, priorityActiveTokens[i])
+
+		curTotalLimit -= priorityRealLimit[i]
 	}
 
 	type groupFillRate struct {
@@ -314,7 +304,8 @@ func (km *KeyspaceResourceGroupManager) updateResourceGroupRULimits() {
 		}
 
 		for _, g := range groups {
-			expectedTokens := min(priorityCurLimit*g.tracker.fillRate/totalFillRate, g.tracker.fillRate)
+			expectedTokens := max(min(priorityCurLimit*g.tracker.fillRate/totalFillRate, g.tracker.fillRate), MIN_TOKEN_FILL_RATE)
+
 			if expectedTokens < g.tracker.overrideRUPerSec*0.95 || expectedTokens > g.tracker.overrideRUPerSec*1.05 {
 				g.tracker.overrideRUPerSec = expectedTokens
 				updateGroups = append(updateGroups, groupFillRate{
