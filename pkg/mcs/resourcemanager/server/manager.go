@@ -165,6 +165,7 @@ func (m *Manager) Init(ctx context.Context) error {
 			Mode: rmpb.GroupMode_RUMode,
 			RUSettings: &RequestUnitSettings{
 				RU: &GroupTokenBucket{
+					name: reservedDefaultGroupName,
 					Settings: &rmpb.TokenLimitSettings{
 						FillRate:   math.MaxInt32,
 						BurstLimit: -1,
@@ -448,7 +449,8 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 					sqlCPUCost.DeleteLabelValues(r.name, r.name, r.ruType)
 					requestCount.DeleteLabelValues(r.name, r.name, readTypeLabel)
 					requestCount.DeleteLabelValues(r.name, r.name, writeTypeLabel)
-					availableRUCounter.DeleteLabelValues(r.name, r.name, r.ruType)
+					availableRUCounter.DeleteLabelValues(r.name, r.name)
+					availableRUSlotGauge.DeleteLabelValues(r.name, r.name)
 					delete(m.consumptionRecord, r)
 					delete(maxPerSecTrackers, r.name)
 					readRequestUnitMaxPerSecCost.DeleteLabelValues(r.name)
@@ -469,10 +471,12 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 			// prevent many groups and hold the lock long time.
 			for _, group := range groups {
 				ru := group.getRUToken()
-				if ru < 0 {
-					ru = 0
-				}
+				// if ru < 0 {
+				// 	ru = 0
+				// }
 				availableRUCounter.WithLabelValues(group.Name, group.Name).Set(ru)
+				totolRUSlot := group.getRUSlotTokens()
+				availableRUSlotGauge.WithLabelValues(group.Name, group.Name).Set(totolRUSlot)
 				resourceGroupConfigGauge.WithLabelValues(group.Name, priorityLabel).Set(float64(group.Priority))
 				resourceGroupConfigGauge.WithLabelValues(group.Name, ruPerSecLabel).Set(float64(group.RUSettings.RU.Settings.FillRate))
 				resourceGroupConfigGauge.WithLabelValues(group.Name, ruCapacityLabel).Set(float64(group.RUSettings.RU.Settings.BurstLimit))

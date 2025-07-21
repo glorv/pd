@@ -129,6 +129,13 @@ var (
 			Name:      "available_ru",
 			Help:      "Counter of the available RU for all resource groups.",
 		}, []string{resourceGroupNameLabel, newResourceGroupNameLabel})
+	availableRUSlotGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: ruSubsystem,
+			Name:      "available_ru_slot",
+			Help:      "Counter of the available RU slot for all resource groups.",
+		}, []string{resourceGroupNameLabel, newResourceGroupNameLabel})
 
 	resourceGroupConfigGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -150,6 +157,7 @@ func init() {
 	prometheus.MustRegister(sqlCPUCost)
 	prometheus.MustRegister(requestCount)
 	prometheus.MustRegister(availableRUCounter)
+	prometheus.MustRegister(availableRUSlotGauge)
 	prometheus.MustRegister(readRequestUnitMaxPerSecCost)
 	prometheus.MustRegister(writeRequestUnitMaxPerSecCost)
 	prometheus.MustRegister(resourceGroupConfigGauge)

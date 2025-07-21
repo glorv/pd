@@ -60,9 +60,9 @@ func (rus *RequestUnitSettings) Clone() *RequestUnitSettings {
 }
 
 // NewRequestUnitSettings creates a new RequestUnitSettings with the given token bucket.
-func NewRequestUnitSettings(tokenBucket *rmpb.TokenBucket) *RequestUnitSettings {
+func NewRequestUnitSettings(name string, tokenBucket *rmpb.TokenBucket) *RequestUnitSettings {
 	return &RequestUnitSettings{
-		RU: NewGroupTokenBucket(tokenBucket),
+		RU: NewGroupTokenBucket(name, tokenBucket),
 	}
 }
 
@@ -97,9 +97,20 @@ func (rg *ResourceGroup) Clone() *ResourceGroup {
 }
 
 func (rg *ResourceGroup) getRUToken() float64 {
-	rg.Lock()
-	defer rg.Unlock()
+	rg.RLock()
+	defer rg.RUnlock()
 	return rg.RUSettings.RU.Tokens
+}
+
+func (rg *ResourceGroup) getRUSlotTokens() float64 {
+	rg.RLock()
+	defer rg.RUnlock()
+	total := 0.0
+	for _, slot := range rg.RUSettings.RU.tokenSlots {
+		total += slot.tokenCapacity
+	}
+
+	return total
 }
 
 // PatchSettings patches the resource group settings.
@@ -144,9 +155,9 @@ func FromProtoResourceGroup(group *rmpb.ResourceGroup) *ResourceGroup {
 	switch group.GetMode() {
 	case rmpb.GroupMode_RUMode:
 		if group.GetRUSettings() == nil {
-			rg.RUSettings = NewRequestUnitSettings(nil)
+			rg.RUSettings = NewRequestUnitSettings(group.Name, nil)
 		} else {
-			rg.RUSettings = NewRequestUnitSettings(group.GetRUSettings().GetRU())
+			rg.RUSettings = NewRequestUnitSettings(group.Name, group.GetRUSettings().GetRU())
 		}
 	case rmpb.GroupMode_RawMode:
 		panic("no implementation")

@@ -39,6 +39,7 @@ const (
 // GroupTokenBucket is a token bucket for a resource group.
 // Now we don't save consumption in `GroupTokenBucket`, only statistics it in prometheus.
 type GroupTokenBucket struct {
+	name string
 	// Settings is the setting of TokenBucket.
 	// BurstLimit is used as below:
 	//   - If b == 0, that means the limiter is unlimited capacity. default use in resource controller (burst with a rate within an unlimited capacity).
@@ -60,6 +61,7 @@ func (gtb *GroupTokenBucket) Clone() *GroupTokenBucket {
 	}
 	stateClone := *gtb.GroupTokenBucketState.Clone()
 	return &GroupTokenBucket{
+		name:                  gtb.name,
 		Settings:              settings,
 		GroupTokenBucketState: stateClone,
 	}
@@ -142,6 +144,7 @@ func (gts *GroupTokenBucketState) resetLoan() {
 }
 
 func (gts *GroupTokenBucketState) balanceSlotTokens(
+	name string,
 	clientUniqueID uint64,
 	settings *rmpb.TokenLimitSettings,
 	requiredToken, elapseTokens float64) {
@@ -246,14 +249,18 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 		slot.requireTokensSum += requiredToken
 		gts.clientConsumptionTokensSum += requiredToken
 	}
+	log.Info("token slot after balance", zap.String("name", name), zap.Float64("tokens", gts.Tokens), zap.Any("slots", gts.tokenSlots))
 }
 
 // NewGroupTokenBucket returns a new GroupTokenBucket
-func NewGroupTokenBucket(tokenBucket *rmpb.TokenBucket) *GroupTokenBucket {
+func NewGroupTokenBucket(name string, tokenBucket *rmpb.TokenBucket) *GroupTokenBucket {
 	if tokenBucket == nil || tokenBucket.Settings == nil {
-		return &GroupTokenBucket{}
+		return &GroupTokenBucket{
+			name: name,
+		}
 	}
 	return &GroupTokenBucket{
+		name:     name,
 		Settings: tokenBucket.GetSettings(),
 		GroupTokenBucketState: GroupTokenBucketState{
 			Tokens:     tokenBucket.GetTokens(),
@@ -329,7 +336,7 @@ func (gtb *GroupTokenBucket) updateTokens(now time.Time, burstLimit int64, clien
 		gtb.resetLoan()
 	}
 	// Balance each slots.
-	gtb.balanceSlotTokens(clientUniqueID, gtb.Settings, consumptionToken, elapseTokens)
+	gtb.balanceSlotTokens(gtb.name, clientUniqueID, gtb.Settings, consumptionToken, elapseTokens)
 }
 
 // request requests tokens from the corresponding slot.
@@ -347,6 +354,11 @@ func (gtb *GroupTokenBucket) request(now time.Time,
 	// Update bucket to record all tokens.
 	gtb.Tokens -= slot.lastTokenCapacity - slot.tokenCapacity
 	slot.lastTokenCapacity = slot.tokenCapacity
+
+	log.Info("[resourc_manager] request tokens", zap.String("name", gtb.name), zap.Float64("needed_tokens", neededTokens),
+		zap.Uint64("client_id", clientUniqueID), zap.Uint64("target_peroid_ms", targetPeriodMs),
+		zap.Any("res", res), zap.Int64("trickle_dur", trickleDuration), 
+		zap.Any("token_slot", slot))
 
 	return res, trickleDuration
 }
