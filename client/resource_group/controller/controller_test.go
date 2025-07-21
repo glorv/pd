@@ -453,7 +453,7 @@ func TestTryGetController(t *testing.T) {
 	requestInfo, responseInfo := NewTestRequestInfo(true, 1, 1, AccessCrossZone), NewTestResponseInfo(1, time.Millisecond, true)
 	_, _, _, _, err = controller.OnRequestWait(ctx, "test-group", requestInfo)
 	re.NoError(err)
-	consumption, err := controller.OnResponse("test-group", requestInfo, responseInfo)
+	consumption, err := controller.OnResponse(ctx, "test-group", requestInfo, responseInfo)
 	re.NoError(err)
 	re.NotEmpty(consumption)
 	// Mark the tombstone manually to test the fallback case.

@@ -478,9 +478,9 @@ func (suite *resourceManagerClientTestSuite) TestResourceGroupController() {
 				_, _, _, _, err = rgsController.OnRequestWait(suite.ctx, cas.resourceGroupName, wreq)
 				re.NoError(err)
 				sum += time.Since(startTime)
-				_, err = rgsController.OnResponse(cas.resourceGroupName, rreq, rres)
+				_, err = rgsController.OnResponse(suite.ctx, cas.resourceGroupName, rreq, rres)
 				re.NoError(err)
-				_, err = rgsController.OnResponse(cas.resourceGroupName, wreq, wres)
+				_, err = rgsController.OnResponse(suite.ctx, cas.resourceGroupName, wreq, wres)
 				re.NoError(err)
 				time.Sleep(time.Millisecond)
 			}
@@ -583,9 +583,9 @@ func (suite *resourceManagerClientTestSuite) TestSwitchBurst() {
 		re.NoError(err)
 		_, _, _, _, err = controller.OnRequestWait(suite.ctx, resourceGroupName, wreq)
 		re.NoError(err)
-		_, err = controller.OnResponse(resourceGroupName, rreq, rres)
+		_, err = controller.OnResponse(suite.ctx, resourceGroupName, rreq, rres)
 		re.NoError(err)
-		_, err = controller.OnResponse(resourceGroupName, wreq, wres)
+		_, err = controller.OnResponse(suite.ctx, resourceGroupName, wreq, wres)
 		re.NoError(err)
 	}
 	time.Sleep(2 * time.Second)
@@ -626,9 +626,9 @@ func (suite *resourceManagerClientTestSuite) TestSwitchBurst() {
 				_, _, _, _, err = controller.OnRequestWait(suite.ctx, resourceGroupName, wreq)
 				re.NoError(err)
 				sum += time.Since(startTime)
-				_, err = controller.OnResponse(resourceGroupName, rreq, rres)
+				_, err = controller.OnResponse(suite.ctx, resourceGroupName, rreq, rres)
 				re.NoError(err)
-				_, err = controller.OnResponse(resourceGroupName, wreq, wres)
+				_, err = controller.OnResponse(suite.ctx, resourceGroupName, wreq, wres)
 				re.NoError(err)
 				time.Sleep(1000 * time.Microsecond)
 			}
@@ -714,7 +714,7 @@ func (suite *resourceManagerClientTestSuite) TestResourcePenalty() {
 	re.NoError(err)
 	re.Zero(penalty.WriteBytes)
 	re.Zero(penalty.TotalCpuTimeMs)
-	_, err = c.OnResponse(resourceGroupName, req, resp)
+	_, err = c.OnResponse(suite.ctx, resourceGroupName, req, resp)
 	re.NoError(err)
 
 	req = controller.NewTestRequestInfo(true, 60, 1 /* store1 */, controller.AccessLocalZone)
@@ -723,7 +723,7 @@ func (suite *resourceManagerClientTestSuite) TestResourcePenalty() {
 	re.NoError(err)
 	re.Zero(penalty.WriteBytes)
 	re.Zero(penalty.TotalCpuTimeMs)
-	_, err = c.OnResponse(resourceGroupName, req, resp)
+	_, err = c.OnResponse(suite.ctx, resourceGroupName, req, resp)
 	re.NoError(err)
 
 	// failed request, shouldn't be counted in penalty
@@ -733,7 +733,7 @@ func (suite *resourceManagerClientTestSuite) TestResourcePenalty() {
 	re.NoError(err)
 	re.Zero(penalty.WriteBytes)
 	re.Zero(penalty.TotalCpuTimeMs)
-	_, err = c.OnResponse(resourceGroupName, req, resp)
+	_, err = c.OnResponse(suite.ctx, resourceGroupName, req, resp)
 	re.NoError(err)
 
 	// from same store, should be zero
@@ -742,7 +742,7 @@ func (suite *resourceManagerClientTestSuite) TestResourcePenalty() {
 	_, penalty, _, _, err = c.OnRequestWait(suite.ctx, resourceGroupName, req1)
 	re.NoError(err)
 	re.Zero(penalty.WriteBytes)
-	_, err = c.OnResponse(resourceGroupName, req1, resp1)
+	_, err = c.OnResponse(suite.ctx, resourceGroupName, req1, resp1)
 	re.NoError(err)
 
 	// from different store, should be non-zero
@@ -752,7 +752,7 @@ func (suite *resourceManagerClientTestSuite) TestResourcePenalty() {
 	re.NoError(err)
 	re.Equal(60.0, penalty.WriteBytes)
 	re.InEpsilon(10.0/1000.0/1000.0, penalty.TotalCpuTimeMs, 1e-6)
-	_, err = c.OnResponse(resourceGroupName, req2, resp2)
+	_, err = c.OnResponse(suite.ctx, resourceGroupName, req2, resp2)
 	re.NoError(err)
 
 	// from new store, should be zero
@@ -761,7 +761,7 @@ func (suite *resourceManagerClientTestSuite) TestResourcePenalty() {
 	_, penalty, _, _, err = c.OnRequestWait(suite.ctx, resourceGroupName, req3)
 	re.NoError(err)
 	re.Zero(penalty.WriteBytes)
-	_, err = c.OnResponse(resourceGroupName, req3, resp3)
+	_, err = c.OnResponse(suite.ctx, resourceGroupName, req3, resp3)
 	re.NoError(err)
 
 	// from different group, should be zero
@@ -771,7 +771,7 @@ func (suite *resourceManagerClientTestSuite) TestResourcePenalty() {
 	_, penalty, _, _, err = c.OnRequestWait(suite.ctx, resourceGroupName, req4)
 	re.NoError(err)
 	re.Zero(penalty.WriteBytes)
-	_, err = c.OnResponse(resourceGroupName, req4, resp4)
+	_, err = c.OnResponse(suite.ctx, resourceGroupName, req4, resp4)
 	re.NoError(err)
 
 	err = c.Stop()
@@ -1390,7 +1390,7 @@ func (suite *resourceManagerClientTestSuite) TestRemoveStaleResourceGroup() {
 	for range testConfig.times {
 		_, _, _, _, err = controller.OnRequestWait(suite.ctx, group.Name, rreq)
 		re.NoError(err)
-		_, err = controller.OnResponse(group.Name, rreq, rres)
+		_, err = controller.OnResponse(suite.ctx, group.Name, rreq, rres)
 		re.NoError(err)
 		time.Sleep(100 * time.Microsecond)
 	}

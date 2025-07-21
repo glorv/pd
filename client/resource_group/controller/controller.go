@@ -74,7 +74,7 @@ type ResourceGroupKVInterceptor interface {
 	// OnRequestWait is used to check whether resource group has enough tokens. It maybe needs to wait some time.
 	OnRequestWait(ctx context.Context, resourceGroupName string, info RequestInfo) (*rmpb.Consumption, *rmpb.Consumption, time.Duration, uint32, error)
 	// OnResponse is used to consume tokens after receiving response.
-	OnResponse(resourceGroupName string, req RequestInfo, resp ResponseInfo) (*rmpb.Consumption, error)
+	OnResponse(ctx context.Context, resourceGroupName string, req RequestInfo, resp ResponseInfo) (*rmpb.Consumption, error)
 	// OnResponseWait is used to consume tokens after receiving a response. If the response requires many tokens, we need to wait for the tokens.
 	// This is an optimized version of OnResponse for cases where the response requires many tokens, making the debt smaller and smoother.
 	OnResponseWait(ctx context.Context, resourceGroupName string, req RequestInfo, resp ResponseInfo) (*rmpb.Consumption, time.Duration, error)
@@ -582,6 +582,7 @@ func (c *ResourceGroupsController) cleanUpResourceGroup() {
 			if gc.inactive || gc.tombstone.Load() {
 				c.groupsController.Delete(resourceGroupName)
 				metrics.ResourceGroupStatusGauge.DeleteLabelValues(resourceGroupName, resourceGroupName)
+				log.Info("[resource group controller] remove tombstone or cold resource group", zap.String("name", resourceGroupName), zap.Bool("tombstone", gc.tombstone.Load()))
 				return true
 			}
 			gc.inactive = true
@@ -686,11 +687,11 @@ func (c *ResourceGroupsController) OnRequestWait(
 
 // OnResponse is used to consume tokens after receiving response
 func (c *ResourceGroupsController) OnResponse(
-	resourceGroupName string, req RequestInfo, resp ResponseInfo,
+	ctx context.Context, resourceGroupName string, req RequestInfo, resp ResponseInfo,
 ) (*rmpb.Consumption, error) {
-	gc, ok := c.loadGroupController(resourceGroupName)
-	if !ok {
-		log.Warn("[resource group controller] resource group name does not exist", zap.String("name", resourceGroupName))
+	gc, err := c.tryGetResourceGroupController(ctx, resourceGroupName, true)
+	if err != nil {
+		log.Warn("[resource group controller] resource group name does not exist", zap.String("name", resourceGroupName), zap.Error(err))
 		return &rmpb.Consumption{}, nil
 	}
 	return gc.onResponseImpl(req, resp)
@@ -700,9 +701,9 @@ func (c *ResourceGroupsController) OnResponse(
 func (c *ResourceGroupsController) OnResponseWait(
 	ctx context.Context, resourceGroupName string, req RequestInfo, resp ResponseInfo,
 ) (*rmpb.Consumption, time.Duration, error) {
-	gc, ok := c.loadGroupController(resourceGroupName)
-	if !ok {
-		log.Warn("[resource group controller] resource group name does not exist", zap.String("name", resourceGroupName))
+	gc, err := c.tryGetResourceGroupController(ctx, resourceGroupName, true)
+	if err != nil {
+		log.Warn("[resource group controller] resource group name does not exist", zap.String("name", resourceGroupName), zap.Error(err))
 		return &rmpb.Consumption{}, time.Duration(0), nil
 	}
 	return gc.onResponseWaitImpl(ctx, req, resp)
@@ -1468,7 +1469,9 @@ func (gc *groupCostController) onRequestWaitImpl(
 			})
 			return nil, nil, waitDuration, 0, err
 		}
-		gc.metrics.successfulRequestDuration.Observe(d.Seconds())
+		if d > 0 {
+			gc.metrics.successfulRequestDuration.Observe(d.Seconds())
+		}
 		waitDuration += d
 	}
 
@@ -1550,7 +1553,9 @@ func (gc *groupCostController) onResponseWaitImpl(
 			}
 			return nil, waitDuration, err
 		}
-		gc.metrics.successfulRequestDuration.Observe(d.Seconds())
+		if d > 0 {
+			gc.metrics.successfulRequestDuration.Observe(d.Seconds())
+		}
 		waitDuration += d
 	}
 
