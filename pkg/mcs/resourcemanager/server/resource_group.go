@@ -102,15 +102,15 @@ func (rg *ResourceGroup) getRUToken() float64 {
 	return rg.RUSettings.RU.Tokens
 }
 
-func (rg *ResourceGroup) getRUSlotTokens() float64 {
+func (rg *ResourceGroup) getAllSlotFillRates() map[uint64]uint64 {
 	rg.RLock()
 	defer rg.RUnlock()
-	total := 0.0
-	for _, slot := range rg.RUSettings.RU.tokenSlots {
-		total += slot.tokenCapacity
+	slot := rg.RUSettings.RU.tokenSlots
+	res := make(map[uint64]uint64, len(slot))
+	for id, s := range slot {
+		res[id] = s.settings.FillRate
 	}
-
-	return total
+	return res
 }
 
 // PatchSettings patches the resource group settings.

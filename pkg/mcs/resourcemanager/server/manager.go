@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -450,7 +451,7 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 					requestCount.DeleteLabelValues(r.name, r.name, readTypeLabel)
 					requestCount.DeleteLabelValues(r.name, r.name, writeTypeLabel)
 					availableRUCounter.DeleteLabelValues(r.name, r.name)
-					availableRUSlotGauge.DeleteLabelValues(r.name, r.name)
+					//slotFillRateGauge.DeleteLabelValues(r.name, r.name)
 					delete(m.consumptionRecord, r)
 					delete(maxPerSecTrackers, r.name)
 					readRequestUnitMaxPerSecCost.DeleteLabelValues(r.name)
@@ -474,9 +475,11 @@ func (m *Manager) backgroundMetricsFlush(ctx context.Context) {
 				// if ru < 0 {
 				// 	ru = 0
 				// }
+				slots := group.getAllSlotFillRates()
+				for id, rate := range slots {
+					slotFillRateGauge.WithLabelValues(group.Name, strconv.FormatUint(id, 10)).Set(float64(rate))
+				}
 				availableRUCounter.WithLabelValues(group.Name, group.Name).Set(ru)
-				totolRUSlot := group.getRUSlotTokens()
-				availableRUSlotGauge.WithLabelValues(group.Name, group.Name).Set(totolRUSlot)
 				resourceGroupConfigGauge.WithLabelValues(group.Name, priorityLabel).Set(float64(group.Priority))
 				resourceGroupConfigGauge.WithLabelValues(group.Name, ruPerSecLabel).Set(float64(group.RUSettings.RU.Settings.FillRate))
 				resourceGroupConfigGauge.WithLabelValues(group.Name, ruCapacityLabel).Set(float64(group.RUSettings.RU.Settings.BurstLimit))

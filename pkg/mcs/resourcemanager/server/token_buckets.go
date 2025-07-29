@@ -249,7 +249,33 @@ func (gts *GroupTokenBucketState) balanceSlotTokens(
 		slot.requireTokensSum += requiredToken
 		gts.clientConsumptionTokensSum += requiredToken
 	}
-	log.Info("token slot after balance", zap.String("name", name), zap.Float64("tokens", gts.Tokens), zap.Any("slots", gts.tokenSlots))
+
+	slots := make(map[uint64]slotSetting, len(gts.tokenSlots))
+	for id, s := range gts.tokenSlots {
+		slots[id] = toSlotSetting(s)
+	}
+
+	log.Info("token slot after balance", zap.String("name", name), zap.Float64("tokens", gts.Tokens), zap.Any("slots", slots))
+}
+
+type slotSetting struct {
+	FillRate             uint64   `protobuf:"varint,1,opt,name=fill_rate,json=fillRate,proto3" json:"fill_rate,omitempty"`
+	BurstLimit           int64    `protobuf:"varint,2,opt,name=burst_limit,json=burstLimit,proto3" json:"burst_limit,omitempty"`
+	MaxTokens            float64  `protobuf:"fixed64,3,opt,name=max_tokens,json=maxTokens,proto3" json:"max_tokens,omitempty"`
+	// requireTokensSum is the number of tokens required.
+	RequireTokensSum float64
+	// tokenCapacity is the number of tokens in the slot.
+	TokenCapacity     float64
+}
+
+func toSlotSetting(s *TokenSlot) slotSetting {
+	return slotSetting {
+		FillRate: s.settings.FillRate,
+		BurstLimit: s.settings.BurstLimit,
+		MaxTokens: s.settings.MaxTokens,
+		RequireTokensSum: s.requireTokensSum,
+		TokenCapacity: s.tokenCapacity,
+	}
 }
 
 // NewGroupTokenBucket returns a new GroupTokenBucket
